@@ -24,26 +24,31 @@ Some shorthand:
 - PoW: proof of work
 - Tx: transaction
 
+Resources:
+
+- https://en.bitcoin.it/wiki/Protocol_rules
+
 TODO:
 
 - txn signing
 - block assembly
 - singlet mining
 - p2p
-- Replace-by-fee
-- Address generation with RIPEMD160 & base58check per
-  https://en.bitcoin.it/wiki/Technical_background_of_version_1_Bitcoin_addresses
+- utxo index & undo log
+- replace-by-fee
 
 """
 import time
 import json
 import binascii
 import hashlib
+import threading
 import logging
-from functools import lru_cache
+from functools import lru_cache, wraps
 from typing import (
     Iterable, NamedTuple, Dict, Mapping, Union, get_type_hints, Tuple)
 
+import ecdsa
 from base58 import b58encode_check
 
 
@@ -215,26 +220,141 @@ active_chain: Iterable[Block] = []
 # Branches off of the main chain.
 side_branches: Iterable[Iterable[Block]] = []
 
+# Synchronize access to the active chain and side branches.
+chain_lock = threading.RLock()
 
+
+def with_lock(lock):
+    def dec(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with lock:
+                return func(*args, **kwargs)
+        return wrapper
+    return dec
+
+
+orphan_blocks: Iterable[Block] = []
+
+# Used to signify the active chain in `find_block`.
+ACTIVE_CHAIN_IDX = 0
+
+
+@with_lock(chain_lock)
 def get_current_height():
     return len(active_chain)
 
 
-def get_height(block_id: str) -> int:
+def idx_to_chain(idx):
+    return active_chain if idx == ACTIVE_CHAIN_IDX else side_branches[idx - 1]
+
+
+@with_lock(chain_lock)
+def get_height(block_hash: str) -> int:
     for i, block in enumerate(active_chain[::-1]):
-        if block.id == block_id:
+        if block.id == block_hash:
             return i
     return -1
 
 
-def find_block(block_id: str, chain=active_chain) -> (Block, int):
+@with_lock(chain_lock)
+def find_block(block_hash: str, chain=active_chain) -> (Block, int, int):
     chains = [chain] if chain else [active_chain, *side_branches]
 
-    for chain in chains:
-        for i, block in enumerate(chain):
-            if block.id == block_id:
-                return (block, i)
-    return (None, None)
+    for chain_idx, chain in enumerate(chains):
+        for height, block in enumerate(chain):
+            if block.id == block_hash:
+                return (block, height, chain_idx)
+    return (None, None, None)
+
+
+@with_lock(chain_lock)
+def find_utxo_for_txin(txin, use_mempool: bool = False) -> UnspentTxOut:
+    """
+    Search the active chain and the mempool for a UTXO corresponding to txin.
+
+    """
+    tx_to_spend_hash = txin.to_spend.txn_hash
+    idx = txin.to_spend.output_index
+    found_utxos = None
+
+    found_in_mempool = (
+        None if not use_mempool else mempool.get(tx_to_spend_hash))
+
+    if found_in_mempool:
+        found_utxos = UnspentTxOut.from_mempool_txn(found_in_mempool.id)
+    else:
+        found_txn = None
+        height = None
+
+        # This is egregiously inefficient way to find a utxo. In bitcoin, we
+        # make use of CCoinsView, an index.
+        for height, block in enumerate(active_chain):
+            for txn in block.txns:
+                if txn.id == tx_to_spend_hash:
+                    found_txn = txn
+                    height = height
+
+        found_utxos = [
+            UnspentTxOut(
+                txid=found_txn.id,
+                is_coinbase=found_txn.is_coinbase, height=height)
+            for txout in getattr(found_txn, 'txouts', [])
+        ]
+
+    if not found_utxos:
+        logger.debug("Couldn't find txn %s", tx_to_spend_hash)
+        return None
+
+    try:
+        return found_utxos[idx]
+    except IndexError:
+        logger.debug(
+            "Transaction %s does not have an output at index %s",
+            tx_to_spend_hash, idx)
+        return None
+
+
+@with_lock(chain_lock)
+def reorg_if_necessary() -> int:
+    # TODO should probably be using `chainwork` for the basis of
+    # comparison here.
+    for i, chain in enumerate(side_branches, 1):
+        fork_block, fork_idx, _ = find_block(chain[0].prev_block_hash)
+        active_height = len(active_chain)
+        branch_height = len(chain) + fork_idx
+
+        if branch_height > active_height:
+            try_reorg(chain)
+
+
+@with_lock(chain_lock)
+def try_reorg(branch, branch_idx, fork_idx):
+    # Use the global keyword so that we can actually swap out the reference
+    # in case of a reorg.
+    global active_chain
+    global side_branches
+
+    old_active = active_chain
+    active_chain = active_chain[:fork_idx] + branch
+
+    for block in branch:
+        try:
+            validate_block(block)
+        except BlockValidationError:
+            logger.info("Block reorg failed - block %s invalid", block.id)
+            active_chain = old_active
+            return 0
+        else:
+            active_chain.append(block)
+
+    # Fix up side branches: remove new active, add old active.
+    side_branches.pop(branch_idx)
+    side_branches.append(old_active[(fork_idx + 1):])
+
+    logger.info(
+        'Chain reorg! New height: %s, tip: %s',
+        len(active_chain), active_chain[-1].id)
 
 
 def get_median_time_past(num_last_blocks: int) -> int:
@@ -251,14 +371,16 @@ def get_median_time_past(num_last_blocks: int) -> int:
 # ----------------------------------------------------------------------------
 
 def get_next_work_required(prev_block_hash: str) -> int:
-    (prev_block, prev_height) = find_block(prev_block_hash, chain=None)
+    (prev_block, prev_height, _) = find_block(prev_block_hash, chain=None)
 
     if (prev_height + 1) % Params.DIFFICULTY_PERIOD_IN_BLOCKS != 0:
         return prev_block.bits
 
-    # #bitcoin-name: CalculateNextWorkRequired
-    period_start_block = active_chain[max(
-        prev_height - (Params.DIFFICULTY_PERIOD_IN_BLOCKS - 1), 0)]
+    with chain_lock:
+        # #bitcoin-name: CalculateNextWorkRequired
+        period_start_block = active_chain[max(
+            prev_height - (Params.DIFFICULTY_PERIOD_IN_BLOCKS - 1), 0)]
+
     actual_time_taken = prev_block.timestamp - period_start_block.timestamp
 
     if actual_time_taken < Params.DIFFICULTY_PERIOD_IN_SECS_TARGET:
@@ -290,18 +412,17 @@ def mine(bits: int, block: Block = None):
 # ----------------------------------------------------------------------------
 
 
-def validate_txn(serialized_txn: str,
-                 as_coinbase: bool = False) -> Transaction:
-    try:
-        txn = deserialize(serialized_txn)
-    except Exception:
-        logger.exception(f"Couldn't deserialize transaction {serialized_txn}")
-        raise TxnValidationError('Couldn not deserialize')
+def validate_txn(txn: Union[Transaction, str],
+                 as_coinbase: bool = False,
+                 allow_utxo_from_mempool: bool = True) -> Transaction:
+    if not isinstance(txn, Transaction):
+        try:
+            txn = deserialize(txn)
+        except Exception:
+            logger.exception(f"Couldn't deserialize transaction {txn}")
+            raise TxnValidationError('Could not deserialize')
 
-    txn.validate_basics()
-
-    if txn in mempool:
-        raise TxnValidationError('Already in mempool')
+    txn.validate_basics(as_coinbase=as_coinbase)
 
     available_to_spend = 0
 
@@ -309,7 +430,7 @@ def validate_txn(serialized_txn: str,
         if find_with_txin_in_mempool(txin):
             raise TxnValidationError(f'TxIn[{i}] already being used')
 
-        utxo = find_utxo_for_txin(txin)
+        utxo = find_utxo_for_txin(txin, use_mempool=allow_utxo_from_mempool)
 
         if not utxo:
             raise TxnValidationError(
@@ -337,12 +458,13 @@ def validate_signature_for_spend(txin: TxIn, utxo: UnspentTxOut):
     raise NotImplementedError
 
 
-def validate_block(serialized_block: str) -> Block:
-    try:
-        block = deserialize(serialized_block)
-    except Exception:
-        logger.exception(f"Couldn't deserialize block {serialized_block}")
-        raise BlockValidationError('Couldn not deserialize')
+def validate_block(block: Union[Block, str]) -> Block:
+    if not isinstance(block, Block):
+        try:
+            block = deserialize(block)
+        except Exception:
+            logger.exception(f"Couldn't deserialize block {block}")
+            raise BlockValidationError("Couldn't deserialize")
 
     if not block.txns:
         raise BlockValidationError('txns empty')
@@ -357,8 +479,8 @@ def validate_block(serialized_block: str) -> Block:
         raise BlockValidationError('First txn must be coinbase and no more')
 
     try:
-        for txn in block.txns:
-            txn.validate_basics()
+        for i, txn in enumerate(block.txns):
+            txn.validate_basics(as_coinbase=(i == 0))
     except TxnValidationError:
         logger.exception(f"Transaction {txn} in {block} failed to validate")
         raise BlockValidationError('Invalid txn {txn.id}')
@@ -376,6 +498,22 @@ def validate_block(serialized_block: str) -> Block:
 
     if block.timestamp <= get_median_time_past(11):
         raise BlockValidationError('timestamp too old')
+
+    _, _, prev_block_chain_idx = find_block(block.prev_block_chain, chain=None)
+
+    # No more validation for a block getting attached to a branch.
+    if prev_block_chain_idx != ACTIVE_CHAIN_IDX:
+        return block, prev_block_chain_idx
+
+    for txn in block.txns[1:]:
+        try:
+            validate_txn(txn, allow_utxo_from_mempool=False)
+        except TxnValidationError:
+            msg = f"{txn} failed to validate"
+            logger.exception(msg)
+            raise BlockValidationError(msg)
+
+    return block, prev_block_chain_idx
 
 
 class BaseException(Exception):
@@ -395,50 +533,22 @@ class BlockValidationError(BaseException):
         self.to_orphan = to_orphan
 
 
-# mempool & UTXO set
+# mempool
 # ----------------------------------------------------------------------------
-
-# Set of unspent transaction outputs. Maps transaction IDs to TxOut objects.
-utxo_set: Dict[str, Iterable[UnspentTxOut]] = {}
 
 # Set of yet-unmined transactions.
 mempool: Dict[str, Transaction] = {}
 
-
 # Set of orphaned (i.e. has inputs referencing yet non-existent UTXOs)
 # transactions.
-orphan_txns = set()
+orphan_txns: Iterable[Transaction] = []
 
 
 def find_with_txin_in_mempool(txin):
-    for txn in mempool:
+    for txn in mempool.values():
         if txin in txn.txins:
             return txn
     return None
-
-
-def find_utxo_for_txin(txin) -> UnspentTxOut:
-    """Search the utxo_set and the mempool for a UTXO corresponding to txin."""
-    tx_to_spend_hash = txin.to_spend.txn_hash
-    idx = txin.to_spend.output_index
-    found_utxos = None
-    found_in_utxo = utxo_set.get(tx_to_spend_hash)
-    found_in_mempool = mempool.get(tx_to_spend_hash)
-
-    if found_in_utxo:
-        found_utxos = found_in_utxo
-    elif found_in_mempool:
-        found_utxos = UnspentTxOut.from_mempool_txn(found_in_mempool.id)
-    else:
-        return None
-
-    try:
-        return found_utxos[idx]
-    except IndexError:
-        logger.debug(
-            "Transaction %s does not have an output at index %s",
-            tx_to_spend_hash, idx)
-        return None
 
 
 # Merkle trees
@@ -474,12 +584,28 @@ def relay_to_peers(serialized_txn: str):
 
 
 def accept_txn(serialized_txn: str):
-    txn = Transaction.validate(serialized_txn)
-    mempool[txn.id] = txn
+    try:
+        txn = validate_txn(serialized_txn)
+    except TxnValidationError as e:
+        if e.to_orphan:
+            orphan_txns.append(e.to_orphan)
+    else:
+        mempool[txn.id] = txn
     relay_to_peers(serialized_txn)
 
 
-# Uninteresting utilities
+def accept_block(serialized_block: str):
+    try:
+        block, chain_idx = validate_block(serialized_block)
+    except BlockValidationError as e:
+        if e.to_orphan:
+            orphan_blocks.append(e.to_orphan)
+    else:
+        chain = idx_to_chain(chain_idx)
+        chain.append[block]
+
+
+# Wallet
 # ----------------------------------------------------------------------------
 
 def pubkey_to_address(pubkey: bytes) -> str:
@@ -491,6 +617,13 @@ def pubkey_to_address(pubkey: bytes) -> str:
     print(binascii.hexlify(ripe))
     return b58encode_check(b'\x00' + ripe)
 
+
+def generate_private_key() -> ecdsa.SigningKey:
+    return ecdsa.SigningKey.generate(curve=ecdsa.SECP256k1)
+
+
+# Uninteresting utilities
+# ----------------------------------------------------------------------------
 
 def serialize(obj) -> str:
     """NamedTuple-flavored serialization to JSON."""
