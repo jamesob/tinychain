@@ -34,11 +34,6 @@ Resources:
 
 TODO:
 
-- txn signing & verification
-- block subsidy halving
-- block assembly
-- singlet mining
-- p2p
 - keep the mempool heap sorted
 - deal with orphan blocks
 - utxo index & undo log
@@ -50,6 +45,10 @@ import json
 import hashlib
 import threading
 import logging
+import socketserver
+import socket
+import random
+import os
 from functools import lru_cache, wraps
 from typing import (
     Iterable, NamedTuple, Dict, Mapping, Union, get_type_hints, Tuple)
@@ -60,7 +59,7 @@ from base58 import b58encode_check
 
 logging.basicConfig(
     level=logging.DEBUG,
-    format='[%(asctime)s][%(levelname)s] %(lineno)d: %(message)s')
+    format='[%(asctime)s][%(module)s:%(lineno)d] %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -105,7 +104,7 @@ class Params:
     DIFFICULTY_PERIOD_IN_BLOCKS = (
         DIFFICULTY_PERIOD_IN_SECS_TARGET / TIME_BETWEEN_BLOCKS_IN_SECS_TARGET)
 
-    INITIAL_DIFFICULTY_BITS = 20
+    INITIAL_DIFFICULTY_BITS = 24
 
     # The number of blocks after which the mining subsidy will halve.
     #
@@ -115,7 +114,7 @@ class Params:
 
 # Used to represent the specific output (since a transaction can have many
 # outputs) within a transaction.
-OutPoint = NamedTuple('OutPoint', [('txid', str), ('output_index', int)])
+OutPoint = NamedTuple('OutPoint', [('txid', str), ('txout_idx', int)])
 
 
 class TxIn(NamedTuple):
@@ -224,10 +223,25 @@ class Block(NamedTuple):
 # Chain
 # ----------------------------------------------------------------------------
 
+genesis_block = Block(
+    version=0,
+    prev_block_hash=None,
+    merkle_hash=(
+        'dfef8eb972026bbe9e98b26616fe90e60e3ff223d0a596e78bde6632109d7ef0'),
+    timestamp=1501396299,
+    bits=26,
+    nonce=1845989,
+    txns=[Transaction(
+        txins=[],
+        txouts=[TxOut(
+            value=5000000000,
+            to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')],
+        locktime=None)])
+
 # The highest proof-of-work, valid blockchain.
 #
 # #bitcoin-name: chainActive
-active_chain: Iterable[Block] = []
+active_chain: Iterable[Block] = [genesis_block]
 
 # Branches off of the main chain.
 side_branches: Iterable[Iterable[Block]] = []
@@ -299,7 +313,7 @@ def find_utxo_in_chain(txin, chain=active_chain) -> UnspentTxOut:
 
     """
     tx_to_spend_hash = txin.to_spend.txid
-    idx = txin.to_spend.output_index
+    idx = txin.to_spend.txout_idx
     found_utxos = None
     found_txn = None
     height = None
@@ -344,6 +358,8 @@ def find_utxo_in_chain(txin, chain=active_chain) -> UnspentTxOut:
 
 @with_lock(chain_lock)
 def reorg_if_necessary() -> int:
+    reorged = False
+
     # TODO should probably be using `chainwork` for the basis of
     # comparison here.
     for i, chain in enumerate(side_branches, 1):
@@ -352,18 +368,20 @@ def reorg_if_necessary() -> int:
         branch_height = len(chain) + fork_idx
 
         if branch_height > active_height:
-            try_reorg(chain)
+            reorged |= try_reorg(chain)
+
+    return reorged
 
 
 @with_lock(chain_lock)
-def try_reorg(branch, branch_idx, fork_idx):
+def try_reorg(branch, branch_idx, fork_idx) -> bool:
     # Use the global keyword so that we can actually swap out the reference
     # in case of a reorg.
     global active_chain
     global side_branches
 
-    old_active_branch = active_chain[fork_idx:]
-    active_chain = active_chain[:(fork_idx + 1)] + branch
+    old_active_branch = active_chain[(fork_idx + 1):]
+    active_chain = active_chain[:fork_idx] + branch
 
     # Keep track of the changes we need to make to the mempool if this reorg
     # succeeds.
@@ -378,7 +396,7 @@ def try_reorg(branch, branch_idx, fork_idx):
         except BlockValidationError:
             logger.info("Block reorg failed - block %s invalid", block.id)
             active_chain = active_chain[:fork_idx] + old_active_branch
-            return 0
+            return False
         else:
             active_chain.append(block)
 
@@ -395,6 +413,8 @@ def try_reorg(branch, branch_idx, fork_idx):
     logger.info(
         'Chain reorg! New height: %s, tip: %s',
         len(active_chain), active_chain[-1].id)
+
+    return True
 
 
 def get_median_time_past(num_last_blocks: int) -> int:
@@ -491,13 +511,24 @@ def get_block_subsidy() -> int:
     return 50 * Params.BELUSHIS_PER_COIN // (2 ** halvings)
 
 
+# Signal to communicate to the mining thread that it should stop mining because
+# we've updated the chain with a new block.
+mine_interrupt = threading.Event()
+
+
 def mine(block):
     start = time.time()
     nonce = 0
     target = (1 << (256 - block.bits))
+    mine_interrupt.clear()
 
     while int(sha256d(block.header(nonce)), 16) >= target:
         nonce += 1
+
+        if nonce % 10000 == 0 and mine_interrupt.is_set():
+            logger.info('[mining] interrupted')
+            mine_interrupt.clear()
+            return None
 
     block = block._replace(nonce=nonce)
     duration = int(time.time() - start) or 0.001
@@ -509,8 +540,11 @@ def mine(block):
 
 def mine_forever():
     while True:
-        connect_block(assemble_and_solve_block('yao'))
-        logger.info(f"chain is {[b.id for b in active_chain]}")
+        block = assemble_and_solve_block(
+            pubkey_to_address(verifying_key.to_string()))
+
+        if block:
+            accept_block(block)
 
 
 # Validation
@@ -691,7 +725,7 @@ def find_with_txin_in_mempool(txin):
 
 def find_utxo_in_mempool(txin) -> UnspentTxOut:
     tx_to_spend_hash = txin.to_spend.txid
-    idx = txin.to_spend.output_index
+    idx = txin.to_spend.txout_idx
     found_in_mempool = mempool.get(tx_to_spend_hash)
 
     if found_in_mempool:
@@ -787,8 +821,7 @@ def get_merkle_root(*leaves: Tuple[str]) -> MerkleNode:
 # Peer-to-peer
 # ----------------------------------------------------------------------------
 
-def relay_to_peers(serialized_txn: str):
-    raise NotImplementedError
+peerlist = [p for p in os.environ.get('TC_PEERLIST', '').split(',') if p]
 
 
 def accept_txn(serialized_txn: str):
@@ -799,19 +832,21 @@ def accept_txn(serialized_txn: str):
             orphan_txns.append(e.to_orphan)
     else:
         mempool[txn.id] = txn
-    relay_to_peers(serialized_txn)
+
+        for peer in peerlist:
+            send_to_peer(txn, peer)
 
 
-def connect_block(block: Union[str, Block]):
+def accept_block(block: Union[str, Block]) -> Union[None, Block]:
+    """Accept a block and return the chain index we append it to."""
     try:
         block, chain_idx = validate_block(block)
     except BlockValidationError as e:
         logger.exception('block %s failed validation', block.id)
-
         if e.to_orphan:
             logger.info(f"saw orphan block {block.id}")
             orphan_blocks.append(e.to_orphan)
-        return
+        return None
 
     logger.info(f'connecting block {block.id} to chain {chain_idx}')
     chain = idx_to_chain(chain_idx)
@@ -820,6 +855,104 @@ def connect_block(block: Union[str, Block]):
     # Remove txs from mempool
     for tx in block.txns:
         mempool.pop(tx.id, None)
+
+    if reorg_if_necessary() or chain_idx == ACTIVE_CHAIN_IDX:
+        mine_interrupt.set()
+
+    for peer in peerlist:
+        send_to_peer(block, peer)
+
+    return chain_idx
+
+
+class P2PMessage(NamedTuple):
+    cmd: str
+
+
+class GetBlocks(P2PMessage):
+    from_blockid: str
+
+    def handle(self, peername):
+        CHUNK_SIZE = 50
+        logger.debug("[p2p] recv getblocks from {peername[0]}")
+
+        with chain_lock:
+            block, height, chain_idx = find_block(
+                self.from_blockid, chain=None)
+
+        if block:
+            chain = idx_to_chain(chain_idx)
+        else:
+            # We don't recognize the requested hash as part of the active
+            # chain, so start at the genesis block.
+            chain = active_chain
+            height = 1
+
+        block_ids = [b.id for b in chain[height:(height + CHUNK_SIZE)]]
+
+        with chain_lock:
+            send_to_peer(Inv('block', block_ids))
+
+
+class Inv(P2PMessage):
+    type: Union['block', 'tx']
+    payload: Iterable[str]
+
+    def handle(self, peername):
+        logger.debug("[p2p] recv inv from {peername[0]}")
+
+        if self.type == 'block':
+            not_in_chain = [
+                b for b in self.payload if not find_block(b, chain=None)[0]]
+
+            if not not_in_chain:
+                return
+
+            for block in not_in_chain:
+                accept_block(block)
+
+            with chain_lock:
+                send_to_peer(GetBlocks(active_chain[-1].id))
+
+        if self.type == 'tx':
+            for tx in (t for t in self.payload if t not in mempool):
+                mempool[tx.id] = tx
+
+
+def read_all_from_socket(req) -> object:
+    data = b''
+    while True:
+        got = req.recv(1024)
+        if not got:
+            break
+        data += got
+    req.close()
+    return deserialize(data.decode())
+
+
+def send_to_peer(data, peer=None):
+    peer = peer or random.choice(peerlist)
+
+    try:
+        with socket.create_connection(peer.split(':')) as s:
+            s.sendall(serialize(data).encode())
+    except Exception:
+        logger.exception(f'failed to send to peer {peer[0]}')
+        return False
+    return True
+
+
+class TCPHandler(socketserver.BaseRequestHandler):
+
+    def handle(self):
+        data = read_all_from_socket(self.request)
+
+        if isinstance(data, P2PMessage):
+            data.handle(self.request.getpeername())
+        elif isinstance(data, Transaction):
+            accept_txn(data)
+        elif isinstance(data, Block):
+            accept_block(data)
 
 
 # Wallet
@@ -834,8 +967,29 @@ def pubkey_to_address(pubkey: bytes) -> str:
     return b58encode_check(b'\x00' + ripe)
 
 
-def generate_private_key() -> ecdsa.SigningKey:
+def new_signing_key() -> ecdsa.SigningKey:
     return ecdsa.SigningKey.generate(curve=ecdsa.SECP256k1)
+
+
+def get_signing_key(privkey: bytes) -> ecdsa.SigningKey:
+    return ecdsa.SigningKey.from_string(privkey, curve=ecdsa.SECP256k1)
+
+
+def write_wallet_file(privkey):
+    with open('wallet.dat', 'wb') as f:
+        f.write(privkey)
+
+
+try:
+    with open('wallet.dat', 'rb') as f:
+        signing_key = get_signing_key(f.read())
+except Exception:
+    logger.exception("generating new signing key")
+    signing_key = new_signing_key()
+    write_wallet_file(signing_key.to_string())
+
+
+verifying_key = signing_key.get_verifying_key()
 
 
 # Uninteresting utilities
@@ -900,5 +1054,19 @@ def _chunks(l, n) -> Iterable[Iterable]:
     return (l[i:i + n] for i in range(0, len(l), n))
 
 
+class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    pass
+
+
 if __name__ == '__main__':
-    mine_forever()
+    workers = []
+    server = socketserver.TCPServer(('0.0.0.0', 9999), ThreadedTCPServer)
+
+    for fnc in (mine_forever, server.serve_forever):
+        worker = threading.Thread(target=fnc)
+        worker.daemon = True
+        worker.start()
+        workers.append(worker)
+
+    logger.info('[p2p] listening on 9999')
+    [w.join() for w in workers]
