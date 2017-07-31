@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 """
+tinychain
+
+Usage:
+  tinychain serve
+  tinychain send <addr> <amount>
+
+Options:
+  -h --help   Show this screen.
+  --version   Show version.
 
 Notes:
 
@@ -23,6 +32,9 @@ Unrealistic simplifications:
 
 - Transaction types limited to P2PKH.
 
+- Initial Block Download eschews `getdata` and instead returns block payloads
+  directly in `inv`.
+
 Some shorthand:
 
 - PoW: proof of work
@@ -34,12 +46,14 @@ Resources:
 
 TODO:
 
+- reorg utxo maintenance
+- write chain to disk
 - keep the mempool heap sorted
 - deal with orphan blocks
-- utxo index & undo log
 - replace-by-fee
 
 """
+import binascii
 import time
 import json
 import hashlib
@@ -51,9 +65,11 @@ import random
 import os
 from functools import lru_cache, wraps
 from typing import (
-    Iterable, NamedTuple, Dict, Mapping, Union, get_type_hints, Tuple)
+    Iterable, NamedTuple, Dict, Mapping, Union, get_type_hints, Tuple,
+    Callable)
 
 import ecdsa
+from docopt import docopt
 from base58 import b58encode_check
 
 
@@ -68,7 +84,9 @@ class Params:
 
     # Coinbase transaction outputs can be spent after this many blocks have
     # elapsed since being mined.
-    COINBASE_MATURITY = 100
+    # XXX is "100" in core.
+    #
+    COINBASE_MATURITY = 2
 
     # Accept blocks which timestamped as being from the future up to this
     # amount.
@@ -104,7 +122,7 @@ class Params:
     DIFFICULTY_PERIOD_IN_BLOCKS = (
         DIFFICULTY_PERIOD_IN_SECS_TARGET / TIME_BETWEEN_BLOCKS_IN_SECS_TARGET)
 
-    INITIAL_DIFFICULTY_BITS = 24
+    INITIAL_DIFFICULTY_BITS = 22
 
     # The number of blocks after which the mining subsidy will halve.
     #
@@ -119,8 +137,9 @@ OutPoint = NamedTuple('OutPoint', [('txid', str), ('txout_idx', int)])
 
 class TxIn(NamedTuple):
     """Inputs to a Transaction."""
-    # A reference to the output we're spending.
-    to_spend: OutPoint
+    # A reference to the output we're spending. This is None for coinbase
+    # transactions.
+    to_spend: Union[OutPoint, None]
 
     # The (signature, pubkey) pair which unlocks the TxOut for spending.
     unlock_sig: bytes
@@ -140,9 +159,13 @@ class TxOut(NamedTuple):
     to_address: str
 
 
-class UnspentTxOut(TxOut):
+class UnspentTxOut(NamedTuple):
+    value: int
+    to_address: str
+
     # The ID of the transaction this output belongs to.
     txid: str
+    tx_idx: int
 
     # Did this TxOut from from a coinbase transaction?
     is_coinbase: bool
@@ -158,6 +181,10 @@ class UnspentTxOut(TxOut):
             cls(**i, txid=txn.id, is_coinbase=False, height=-1)
             for i in txn.txouts]
 
+    @property
+    def outpoint(self):
+        return OutPoint(self.txid, self.tx_idx)
+
 
 class Transaction(NamedTuple):
     txins: Iterable[TxIn]
@@ -170,7 +197,22 @@ class Transaction(NamedTuple):
 
     @property
     def is_coinbase(self) -> bool:
-        return not self.txins
+        return len(self.txins) == 1 and self.txins[0].to_spend is None
+
+    @classmethod
+    def create_coinbase(cls, pay_to_addr, value, height):
+        return cls(
+            txins=[TxIn(
+                to_spend=None,
+                # Push current block height into unlock_sig so that this
+                # transaction's ID is unique relative to other coinbase txns.
+                unlock_sig=str(height).encode(),
+                unlock_pk=None,
+                sequence=0)],
+            txouts=[TxOut(
+                value=value,
+                to_address=pay_to_addr)],
+        )
 
     @property
     def id(self) -> str:
@@ -241,7 +283,7 @@ genesis_block = Block(
 # The highest proof-of-work, valid blockchain.
 #
 # #bitcoin-name: chainActive
-active_chain: Iterable[Block] = [genesis_block]
+active_chain: Iterable[Block] = []
 
 # Branches off of the main chain.
 side_branches: Iterable[Iterable[Block]] = []
@@ -275,16 +317,17 @@ def idx_to_chain(idx):
     return active_chain if idx == ACTIVE_CHAIN_IDX else side_branches[idx - 1]
 
 
+@with_lock(chain_lock)
 def txn_iterator(chain):
-    return (txn for block in chain for txn in block.txns)
-
-
-def txout_iterator(chain):
-    return (txout for txn in txn_iterator(chain) for txout in txn.txouts)
+    return (
+        (txn, block, height)
+        for height, block in enumerate(chain) for txn in block.txns)
 
 
 def txin_iterator(chain):
-    return (txin for txn in txn_iterator(chain) for txin in txn.txins)
+    return (
+        (txin, height)
+        for txn, _, height in txn_iterator(chain) for txin in txn.txins)
 
 
 @with_lock(chain_lock)
@@ -306,54 +349,17 @@ def find_block(block_hash: str, chain=active_chain) -> (Block, int, int):
     return (None, None, None)
 
 
-def find_utxo_in_chain(txin, chain=active_chain) -> UnspentTxOut:
-    """
-    Search an iterable of transactions (could be a chain)for a UTXO
-    corresponding to txin.
+utxo_set: Mapping[OutPoint, UnspentTxOut] = {}
 
-    """
-    tx_to_spend_hash = txin.to_spend.txid
-    idx = txin.to_spend.txout_idx
-    found_utxos = None
-    found_txn = None
-    height = None
 
-    # This is egregiously inefficient way to find a utxo. In bitcoin, we
-    # make use of CCoinsView, an index of UTXOs.
-    for height, block in enumerate(active_chain):
-        for txn in block.txns:
-            if txn.id == tx_to_spend_hash:
-                found_txn = txn
-                height = height
+def add_to_utxo(txout, tx, idx, is_coinbase, height):
+    utxo = UnspentTxOut(
+        *txout, txid=tx.id, tx_idx=idx, is_coinbase=is_coinbase, height=height)
+    utxo_set[utxo.outpoint] = utxo
 
-    if not found_txn:
-        return None
 
-    # Ensure found txout hasn't already been spent.
-    for _txin in txin_iterator(active_chain[(height - 1):]):
-        if _txin.to_spend == txin.to_spend:
-            logger.debug(
-                "txin %s already spent in block %s", txin.to_spend, block.id)
-            return None
-
-    found_utxos = [
-        UnspentTxOut(
-            txid=found_txn.id,
-            is_coinbase=found_txn.is_coinbase, height=height)
-        for txout in getattr(found_txn, 'txouts', [])
-    ]
-
-    if not found_utxos:
-        logger.debug("Couldn't find txn %s", tx_to_spend_hash)
-        return None
-
-    try:
-        return found_utxos[idx]
-    except IndexError:
-        logger.debug(
-            "Transaction %s does not have an output at index %s",
-            tx_to_spend_hash, idx)
-        return None
+def rm_from_utxo(txid, tx_idx):
+    del utxo_set[OutPoint(txid, tx_idx)]
 
 
 @with_lock(chain_lock)
@@ -394,7 +400,7 @@ def try_reorg(branch, branch_idx, fork_idx) -> bool:
         try:
             validate_block(block)
         except BlockValidationError:
-            logger.info("Block reorg failed - block %s invalid", block.id)
+            logger.info("block reorg failed - block %s invalid", block.id)
             active_chain = active_chain[:fork_idx] + old_active_branch
             return False
         else:
@@ -411,7 +417,7 @@ def try_reorg(branch, branch_idx, fork_idx) -> bool:
         mempool[txn_id] = txn
 
     logger.info(
-        'Chain reorg! New height: %s, tip: %s',
+        'chain reorg! New height: %s, tip: %s',
         len(active_chain), active_chain[-1].id)
 
     return True
@@ -474,11 +480,8 @@ def assemble_and_solve_block(pay_coinbase_to_addr, txns=None):
         block = select_from_mempool(block)
 
     fees = calculate_fees(block)
-    coinbase_txn = Transaction(
-        txins=[],
-        txouts=[TxOut(value=(get_block_subsidy() + fees),
-                      to_address=pay_coinbase_to_addr)])
-
+    coinbase_txn = Transaction.create_coinbase(
+        my_address, (get_block_subsidy() + fees), len(active_chain))
     block = block._replace(txns=[coinbase_txn, *block.txns])
     block = block._replace(merkle_hash=get_merkle_root_of_txns(block.txns).val)
 
@@ -491,8 +494,12 @@ def assemble_and_solve_block(pay_coinbase_to_addr, txns=None):
 def calculate_fees(block):
     fee = 0
 
+    def utxo_from_block(txin):
+        tx = [t.txouts for t in block.txns if t.id == txin.to_spend.txid]
+        return tx[0][txin.to_spend.tx_idx] if tx else None
+
     def find_utxo(txin):
-        return find_utxo_in_chain(txin) or find_utxo_in_chain(txin, [block])
+        return utxo_set.get(txin.to_spend) or utxo_from_block(txin)
 
     for txn in block.txns:
         spent = sum(find_utxo(i).value for i in txn.txins)
@@ -540,11 +547,10 @@ def mine(block):
 
 def mine_forever():
     while True:
-        block = assemble_and_solve_block(
-            pubkey_to_address(verifying_key.to_string()))
+        block = assemble_and_solve_block(my_address)
 
         if block:
-            accept_block(block)
+            connect_block(block)
 
 
 # Validation
@@ -566,10 +572,7 @@ def validate_txn(txn: Union[Transaction, str],
     available_to_spend = 0
 
     for i, txin in enumerate(txn.txins):
-        if find_with_txin_in_mempool(txin):
-            raise TxnValidationError(f'TxIn[{i}] already being used')
-
-        utxo = find_utxo_in_chain(txin)
+        utxo = utxo_set.get(txin.to_spend)
 
         if allow_utxo_from_mempool:
             utxo = utxo or find_utxo_in_mempool(txin)
@@ -584,9 +587,10 @@ def validate_txn(txn: Union[Transaction, str],
                 Params.COINBASE_MATURITY:
             raise TxnValidationError(f'Coinbase UTXO not ready for spend')
 
-        if not validate_signature_for_spend(txin, utxo, txn):
-            raise TxnValidationError(
-                f'{txin} is not a valid spend of {utxo}')
+        try:
+            validate_signature_for_spend(txin, utxo, txn)
+        except TxUnlockError:
+            raise TxnValidationError(f'{txin} is not a valid spend of {utxo}')
 
         available_to_spend += utxo.value
 
@@ -604,16 +608,22 @@ def validate_signature_for_spend(txin, utxo: UnspentTxOut, txn):
     if pubkey_as_addr != utxo.to_address:
         raise TxUnlockError("Pubkey doesn't match")
 
-    if not verifying_key.verify(
-            txin.unlock_sig, build_spend_message(txin, txn)):
+    try:
+        spend_msg = build_spend_message(
+            txin.to_spend, txin.unlock_pk, txin.sequence, txn.txouts)
+        verifying_key.verify(txin.unlock_sig, spend_msg)
+    except Exception:
+        logger.exception('Key verification failed')
         raise TxUnlockError("Signature doesn't match")
 
+    return True
 
-def build_spend_message(txin, txn):
+
+def build_spend_message(to_spend, pk, sequence, txouts) -> bytes:
     # TODO Double check that this is ~roughly~ equivalent to SIGHASH_ALL.
     return sha256d(
-        serialize(txin.to_spend) + str(txin.sequence) +
-        txin.unlock_pk.decode('utf-8') + serialize(txn.txouts))
+        serialize(to_spend) + str(sequence) +
+        binascii.hexlify(pk).decode() + serialize(txouts)).encode()
 
 
 @with_lock(chain_lock)
@@ -748,7 +758,7 @@ def select_from_mempool(block: Block) -> Block:
     added_to_block = set()
 
     def check_block_size(b) -> bool:
-        len(serialize(block)) < Params.MAX_BLOCK_SERIALIZED_SIZE
+        return len(serialize(block)) < Params.MAX_BLOCK_SERIALIZED_SIZE
 
     def add_to_block(block, txid) -> Block:
         if txid in added_to_block:
@@ -758,7 +768,10 @@ def select_from_mempool(block: Block) -> Block:
 
         # For any txin that can't be found in the main chain, find its
         # transaction in the mempool (if it exists) and add it to the block.
-        for txin in (i for i in tx.txins if not find_utxo_in_chain(i)):
+        for txin in tx.txins:
+            if txin.to_spend in utxo_set:
+                continue
+
             in_mempool = find_utxo_in_mempool(txin)
 
             if not in_mempool:
@@ -773,6 +786,7 @@ def select_from_mempool(block: Block) -> Block:
         newblock = block._replace(txns=[*block.txns, tx])
 
         if check_block_size(newblock):
+            logger.debug(f'added tx {tx.id} to block')
             added_to_block.add(txid)
             return newblock
         else:
@@ -829,15 +843,19 @@ def accept_txn(serialized_txn: str):
         txn = validate_txn(serialized_txn)
     except TxnValidationError as e:
         if e.to_orphan:
+            logger.info(f'txn {e.to_orphan.id} submitted as orphan')
             orphan_txns.append(e.to_orphan)
+        else:
+            logger.exception(f'txn rejected')
     else:
+        logger.info(f'txn {txn.id} added to mempool')
         mempool[txn.id] = txn
 
         for peer in peerlist:
             send_to_peer(txn, peer)
 
 
-def accept_block(block: Union[str, Block]) -> Union[None, Block]:
+def connect_block(block: Union[str, Block]) -> Union[None, Block]:
     """Accept a block and return the chain index we append it to."""
     try:
         block, chain_idx = validate_block(block)
@@ -848,6 +866,9 @@ def accept_block(block: Union[str, Block]) -> Union[None, Block]:
             orphan_blocks.append(e.to_orphan)
         return None
 
+    if find_block(block.id)[0]:  # Already seen it.
+        return None
+
     logger.info(f'connecting block {block.id} to chain {chain_idx}')
     chain = idx_to_chain(chain_idx)
     chain.append(block)
@@ -856,8 +877,17 @@ def accept_block(block: Union[str, Block]) -> Union[None, Block]:
     for tx in block.txns:
         mempool.pop(tx.id, None)
 
+        if not tx.is_coinbase:
+            for txin in tx.txins:
+                rm_from_utxo(*txin.to_spend)
+        for i, txout in enumerate(tx.txouts):
+            add_to_utxo(txout, tx, i, tx.is_coinbase, len(chain))
+
     if reorg_if_necessary() or chain_idx == ACTIVE_CHAIN_IDX:
         mine_interrupt.set()
+        logger.info(
+            f'block accepted '
+            f'height={len(active_chain) - 1} txns={len(block.txns)}')
 
     for peer in peerlist:
         send_to_peer(block, peer)
@@ -865,40 +895,62 @@ def accept_block(block: Union[str, Block]) -> Union[None, Block]:
     return chain_idx
 
 
-class P2PMessage(NamedTuple):
-    cmd: str
+@with_lock(chain_lock)
+def disconnect_block(block, chain=active_chain):
+    assert block == chain[-1], "Block being disconnected must be tip."
+
+    for tx in block.txns:
+        mempool[tx.id] = tx
+
+        for txin in tx.txins:
+            add_to_utxo(*_find_txout_for_txin(txin, chain))
+        for i in range(tx.txouts):
+            rm_from_utxo(tx.id, i)
+
+    chain.pop()
+    logger.info(f'block {block.id} disconnected')
 
 
-class GetBlocks(P2PMessage):
+def _find_txout_for_txin(txin, chain):
+    """TODO: clean this garbage up."""
+    txid, tx_idx = txin.to_spend
+
+    for tx, block, height in txn_iterator(chain):
+        if tx.id == txid:
+            txout = tx.txouts[tx_idx]
+            return (txout, tx, tx_idx, tx.is_coinbase, height)
+
+
+class GetBlocks(NamedTuple):
+    """
+    See https://bitcoin.org/en/developer-guide#blocks-first
+
+    """
     from_blockid: str
 
-    def handle(self, peername):
+    def handle(self, sock, peername):
         CHUNK_SIZE = 50
         logger.debug("[p2p] recv getblocks from {peername[0]}")
 
         with chain_lock:
-            block, height, chain_idx = find_block(
-                self.from_blockid, chain=None)
+            # Only reference our current active chain.
+            _, height, _ = find_block(self.from_blockid)
 
-        if block:
-            chain = idx_to_chain(chain_idx)
-        else:
-            # We don't recognize the requested hash as part of the active
-            # chain, so start at the genesis block.
-            chain = active_chain
-            height = 1
-
-        block_ids = [b.id for b in chain[height:(height + CHUNK_SIZE)]]
+        # If we don't recognize the requested hash as part of the active
+        # chain, start at the genesis block.
+        height = height or 1
 
         with chain_lock:
-            send_to_peer(Inv('block', block_ids))
+            blocks = active_chain[height:(height + CHUNK_SIZE)]
+
+        send_to_peer(Inv('block', blocks))
 
 
-class Inv(P2PMessage):
+class Inv(NamedTuple):
     type: Union['block', 'tx']
     payload: Iterable[str]
 
-    def handle(self, peername):
+    def handle(self, sock, peername):
         logger.debug("[p2p] recv inv from {peername[0]}")
 
         if self.type == 'block':
@@ -909,7 +961,7 @@ class Inv(P2PMessage):
                 return
 
             for block in not_in_chain:
-                accept_block(block)
+                connect_block(block)
 
             with chain_lock:
                 send_to_peer(GetBlocks(active_chain[-1].id))
@@ -919,6 +971,61 @@ class Inv(P2PMessage):
                 mempool[tx.id] = tx
 
 
+def find_utxos_for_address(addr):
+    return [utxo for utxo in utxo_set.values() if utxo.to_address == addr]
+
+
+class Balance(NamedTuple):
+    addr: str
+
+    def handle(self, sock, peername):
+        my_coins = find_utxos_for_address(self.addr)
+        sock.sendall(str(sum(i.value for i in my_coins)).encode())
+
+
+class Send(NamedTuple):
+    addr: str
+    value: int
+
+    def handle(self, sock, peername):
+        selected = set()
+        my_coins = list(sorted(
+            find_utxos_for_address(my_address),
+            key=lambda i: (i.value, i.height)))
+
+        for coin in my_coins:
+            selected.add(coin)
+            if sum(i.value for i in selected) > self.value:
+                break
+
+        txout = TxOut(value=self.value, to_address=self.addr)
+
+        def make_txin(coin):
+            sequence = 0
+            pk = verifying_key.to_string()
+            spend_msg = build_spend_message(
+                coin.outpoint, pk, sequence, [txout])
+
+            return TxIn(
+                to_spend=coin.outpoint,
+                unlock_pk=pk,
+                unlock_sig=signing_key.sign(spend_msg),
+                sequence=sequence,
+            )
+
+        txn = Transaction(
+            txins=[make_txin(coin) for coin in selected],
+            txouts=[txout])
+
+        logger.info(f'submitting to network: {txn}')
+        accept_txn(txn)
+
+
+class GetMempool(NamedTuple):
+    def handle(self, sock, peername):
+        sock.sendall(serialize(list(mempool.keys())).encode())
+
+
 def read_all_from_socket(req) -> object:
     data = b''
     while True:
@@ -926,7 +1033,6 @@ def read_all_from_socket(req) -> object:
         if not got:
             break
         data += got
-    req.close()
     return deserialize(data.decode())
 
 
@@ -947,12 +1053,12 @@ class TCPHandler(socketserver.BaseRequestHandler):
     def handle(self):
         data = read_all_from_socket(self.request)
 
-        if isinstance(data, P2PMessage):
-            data.handle(self.request.getpeername())
+        if hasattr(data, 'handle') and isinstance(data.handle, Callable):
+            data.handle(self.request, self.request.getpeername())
         elif isinstance(data, Transaction):
             accept_txn(data)
         elif isinstance(data, Block):
-            accept_block(data)
+            connect_block(data)
 
 
 # Wallet
@@ -990,6 +1096,8 @@ except Exception:
 
 
 verifying_key = signing_key.get_verifying_key()
+my_address = pubkey_to_address(verifying_key.to_string())
+logger.info(f"your address is {my_address}")
 
 
 # Uninteresting utilities
@@ -1003,7 +1111,7 @@ def serialize(obj) -> str:
         elif isinstance(o, list):
             return [contents_to_primitive(i) for i in o]
         elif isinstance(o, bytes):
-            return o.decode('utf-8')
+            return binascii.hexlify(o).decode()
         elif not isinstance(o, (dict, bytes, str, int, type(None))):
             raise ValueError(f"Can't serialize {o}")
 
@@ -1035,7 +1143,7 @@ def deserialize(serialized: str) -> object:
             o[k] = contents_to_objs(v)
 
             if k in bytes_keys:
-                o[k] = o[k].encode()
+                o[k] = binascii.unhexlify(o[k])
 
         return _type(**o)
 
@@ -1058,15 +1166,20 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     pass
 
 
+def main(args: dict):
+    if args['serve']:
+        workers = []
+        server = ThreadedTCPServer(('0.0.0.0', 9999), TCPHandler)
+
+        for fnc in (mine_forever, server.serve_forever):
+            worker = threading.Thread(target=fnc)
+            worker.daemon = True
+            worker.start()
+            workers.append(worker)
+
+        logger.info('[p2p] listening on 9999')
+        [w.join() for w in workers]
+
+
 if __name__ == '__main__':
-    workers = []
-    server = socketserver.TCPServer(('0.0.0.0', 9999), ThreadedTCPServer)
-
-    for fnc in (mine_forever, server.serve_forever):
-        worker = threading.Thread(target=fnc)
-        worker.daemon = True
-        worker.start()
-        workers.append(worker)
-
-    logger.info('[p2p] listening on 9999')
-    [w.join() for w in workers]
+    main(docopt(__doc__, version='0.1'))
