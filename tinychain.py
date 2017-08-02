@@ -258,24 +258,18 @@ class Block(NamedTuple):
 # ----------------------------------------------------------------------------
 
 genesis_block = Block(
-    version=0,
-    prev_block_hash=None,
-    merkle_hash=(
-        'dfef8eb972026bbe9e98b26616fe90e60e3ff223d0a596e78bde6632109d7ef0'),
-    timestamp=1501396299,
-    bits=26,
-    nonce=1845989,
+    version=0, prev_block_hash=None,
+    merkle_hash='7118894203235a955a908c0abfc6d8fe6edec47b0a04ce1bf7263da3b4366d22',  # noqa
+    timestamp=1501646462, bits=22, nonce=1779478,
     txns=[Transaction(
-        txins=[],
-        txouts=[TxOut(
-            value=5000000000,
-            to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')],
+        txins=[TxIn(to_spend=None, unlock_sig=b'0', unlock_pk=None, sequence=0)],  # noqa
+        txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')],  # noqa
         locktime=None)])
 
 # The highest proof-of-work, valid blockchain.
 #
 # #bitcoin-name: chainActive
-active_chain: Iterable[Block] = [Block(version=0, prev_block_hash=None, merkle_hash='7118894203235a955a908c0abfc6d8fe6edec47b0a04ce1bf7263da3b4366d22', timestamp=1501646462, bits=22, nonce=1779478, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'0', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')], locktime=None)])]
+active_chain: Iterable[Block] = [genesis_block]
 
 # Branches off of the main chain.
 side_branches: Iterable[Iterable[Block]] = []
@@ -346,7 +340,8 @@ utxo_set: Mapping[OutPoint, UnspentTxOut] = {}
 
 def add_to_utxo(txout, tx, idx, is_coinbase, height):
     utxo = UnspentTxOut(
-        *txout, txid=tx.id, txout_idx=idx, is_coinbase=is_coinbase, height=height)
+        *txout,
+        txid=tx.id, txout_idx=idx, is_coinbase=is_coinbase, height=height)
     utxo_set[utxo.outpoint] = utxo
 
 
