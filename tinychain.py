@@ -165,7 +165,7 @@ class UnspentTxOut(NamedTuple):
 
     # The ID of the transaction this output belongs to.
     txid: str
-    tx_idx: int
+    txout_idx: int
 
     # Did this TxOut from from a coinbase transaction?
     is_coinbase: bool
@@ -173,17 +173,9 @@ class UnspentTxOut(NamedTuple):
     # The blockchain height this TxOut was included in the chain.
     height: int
 
-    @classmethod
-    def from_mempool_txn(cls, txn) -> Iterable['UnspentTxOut']:
-        # UTXO contained in mempool can't be a coinbase transaction --
-        # otherwise it would have been mined and thus found in `utxo_set`.
-        return [
-            cls(**i, txid=txn.id, is_coinbase=False, height=-1)
-            for i in txn.txouts]
-
     @property
     def outpoint(self):
-        return OutPoint(self.txid, self.tx_idx)
+        return OutPoint(self.txid, self.txout_idx)
 
 
 class Transaction(NamedTuple):
@@ -283,7 +275,7 @@ genesis_block = Block(
 # The highest proof-of-work, valid blockchain.
 #
 # #bitcoin-name: chainActive
-active_chain: Iterable[Block] = []
+active_chain: Iterable[Block] = [Block(version=0, prev_block_hash=None, merkle_hash='7118894203235a955a908c0abfc6d8fe6edec47b0a04ce1bf7263da3b4366d22', timestamp=1501646462, bits=22, nonce=1779478, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'0', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')], locktime=None)])]
 
 # Branches off of the main chain.
 side_branches: Iterable[Iterable[Block]] = []
@@ -339,7 +331,7 @@ def get_height(block_hash: str) -> int:
 
 
 @with_lock(chain_lock)
-def find_block(block_hash: str, chain=active_chain) -> (Block, int, int):
+def find_block(block_hash: str, chain=None) -> (Block, int, int):
     chains = [chain] if chain else [active_chain, *side_branches]
 
     for chain_idx, chain in enumerate(chains):
@@ -354,27 +346,29 @@ utxo_set: Mapping[OutPoint, UnspentTxOut] = {}
 
 def add_to_utxo(txout, tx, idx, is_coinbase, height):
     utxo = UnspentTxOut(
-        *txout, txid=tx.id, tx_idx=idx, is_coinbase=is_coinbase, height=height)
+        *txout, txid=tx.id, txout_idx=idx, is_coinbase=is_coinbase, height=height)
     utxo_set[utxo.outpoint] = utxo
 
 
-def rm_from_utxo(txid, tx_idx):
-    del utxo_set[OutPoint(txid, tx_idx)]
+def rm_from_utxo(txid, txout_idx):
+    del utxo_set[OutPoint(txid, txout_idx)]
 
 
 @with_lock(chain_lock)
-def reorg_if_necessary() -> int:
+def reorg_if_necessary() -> bool:
     reorged = False
+    frozen_side_branches = list(side_branches)  # May change during this call.
 
     # TODO should probably be using `chainwork` for the basis of
     # comparison here.
-    for i, chain in enumerate(side_branches, 1):
-        fork_block, fork_idx, _ = find_block(chain[0].prev_block_hash)
+    for i, chain in enumerate(frozen_side_branches, 1):
+        fork_block, fork_idx, _ = find_block(
+            chain[0].prev_block_hash, active_chain)
         active_height = len(active_chain)
         branch_height = len(chain) + fork_idx
 
         if branch_height > active_height:
-            reorged |= try_reorg(chain)
+            reorged |= try_reorg(chain, i, fork_idx)
 
     return reorged
 
@@ -386,35 +380,30 @@ def try_reorg(branch, branch_idx, fork_idx) -> bool:
     global active_chain
     global side_branches
 
-    old_active_branch = active_chain[(fork_idx + 1):]
-    active_chain = active_chain[:fork_idx] + branch
+    fork_block = active_chain[fork_idx]
 
-    # Keep track of the changes we need to make to the mempool if this reorg
-    # succeeds.
-    mempool_mods = {
-        'add': {txn.id: txn for block in branch for txn in block.txns},
-        'rm': [txn.id for block in old_active_branch for txn in block.txns],
-    }
+    def disconnect_to_fork():
+        while active_chain[-1].id != fork_block.id:
+            yield disconnect_block(active_chain[-1])
+
+    old_active = list(disconnect_to_fork())[::-1]
+
+    assert branch[0].prev_block_hash == active_chain[-1].id
+
+    def rollback_reorg():
+        list(disconnect_to_fork())  # Force the gneerator to eval.
+
+        for block in old_active:
+            assert connect_block(block, check_reorg=False) == ACTIVE_CHAIN_IDX
 
     for block in branch:
-        try:
-            validate_block(block)
-        except BlockValidationError:
-            logger.info("block reorg failed - block %s invalid", block.id)
-            active_chain = active_chain[:fork_idx] + old_active_branch
+        if connect_block(block, check_reorg=False) != ACTIVE_CHAIN_IDX:
+            rollback_reorg()
             return False
-        else:
-            active_chain.append(block)
 
     # Fix up side branches: remove new active, add old active.
-    side_branches.pop(branch_idx)
-    side_branches.append(old_active_branch)
-
-    for txn_id in mempool_mods['rm']:
-        mempool.pop(txn_id)
-
-    for txn_id, txn in mempool_mods['add'].items():
-        mempool[txn_id] = txn
+    side_branches.pop(branch_idx - 1)
+    side_branches.append(old_active)
 
     logger.info(
         'chain reorg! New height: %s, tip: %s',
@@ -440,7 +429,7 @@ def get_next_work_required(prev_block_hash: str) -> int:
     if not prev_block_hash:
         return Params.INITIAL_DIFFICULTY_BITS
 
-    (prev_block, prev_height, _) = find_block(prev_block_hash, chain=None)
+    (prev_block, prev_height, _) = find_block(prev_block_hash)
 
     if (prev_height + 1) % Params.DIFFICULTY_PERIOD_IN_BLOCKS != 0:
         return prev_block.bits
@@ -496,7 +485,7 @@ def calculate_fees(block):
 
     def utxo_from_block(txin):
         tx = [t.txouts for t in block.txns if t.id == txin.to_spend.txid]
-        return tx[0][txin.to_spend.tx_idx] if tx else None
+        return tx[0][txin.to_spend.txout_idx] if tx else None
 
     def find_utxo(txin):
         return utxo_set.get(txin.to_spend) or utxo_from_block(txin)
@@ -559,7 +548,9 @@ def mine_forever():
 
 def validate_txn(txn: Union[Transaction, str],
                  as_coinbase: bool = False,
-                 allow_utxo_from_mempool: bool = True) -> Transaction:
+                 siblings_in_block: Iterable[Transaction] = None,
+                 allow_utxo_from_mempool: bool = True,
+                 ) -> Transaction:
     if not isinstance(txn, Transaction):
         try:
             txn = deserialize(txn)
@@ -573,6 +564,9 @@ def validate_txn(txn: Union[Transaction, str],
 
     for i, txin in enumerate(txn.txins):
         utxo = utxo_set.get(txin.to_spend)
+
+        if siblings_in_block:
+            utxo = utxo or find_utxo_in_list(txin, siblings_in_block)
 
         if allow_utxo_from_mempool:
             utxo = utxo or find_utxo_in_mempool(txin)
@@ -668,7 +662,7 @@ def validate_block(block: Union[Block, str]) -> Block:
         prev_block_chain_idx = ACTIVE_CHAIN_IDX
     else:
         prev_block, prev_block_height, prev_block_chain_idx = find_block(
-            block.prev_block_hash, chain=None)
+            block.prev_block_hash)
 
         if not prev_block:
             raise BlockValidationError(
@@ -685,7 +679,8 @@ def validate_block(block: Union[Block, str]) -> Block:
 
     for txn in block.txns[1:]:
         try:
-            validate_txn(txn, allow_utxo_from_mempool=False)
+            validate_txn(txn, siblings_in_block=block.txns[1:],
+                         allow_utxo_from_mempool=False)
         except TxnValidationError:
             msg = f"{txn} failed to validate"
             logger.exception(msg)
@@ -734,23 +729,27 @@ def find_with_txin_in_mempool(txin):
 
 
 def find_utxo_in_mempool(txin) -> UnspentTxOut:
-    tx_to_spend_hash = txin.to_spend.txid
-    idx = txin.to_spend.txout_idx
-    found_in_mempool = mempool.get(tx_to_spend_hash)
-
-    if found_in_mempool:
-        found_utxos = UnspentTxOut.from_mempool_txn(found_in_mempool.id)
-    else:
-        logger.debug("Couldn't find txn %s", tx_to_spend_hash)
-        return None
+    txid, idx = txin.to_spend
 
     try:
-        return found_utxos[idx]
-    except IndexError:
-        logger.debug(
-            "Transaction %s does not have an output at index %s",
-            tx_to_spend_hash, idx)
+        txout = mempool[txid].txouts[idx]
+    except Exception:
+        logger.debug("Couldn't find utxo in mempool for %s", txin)
         return None
+
+    return UnspentTxOut(
+        *txout, txid=txid, is_coinbase=False, height=-1, txout_idx=idx)
+
+
+def find_utxo_in_list(txin, txns) -> UnspentTxOut:
+    txid, txout_idx = txin.to_spend
+    try:
+        txout = [t for t in txns if t.id == txid][0].txouts[txout_idx]
+    except Exception:
+        return None
+
+    return UnspentTxOut(
+        *txout, txid=txid, is_coinbase=False, height=-1, txout_idx=txout_idx)
 
 
 def select_from_mempool(block: Block) -> Block:
@@ -778,7 +777,7 @@ def select_from_mempool(block: Block) -> Block:
                 logger.debug(f"Couldn't find UTXO for {txin}")
                 return None
 
-            block = add_to_block(in_mempool.txid)
+            block = add_to_block(block, in_mempool.txid)
             if not block:
                 logger.debug(f"Couldn't add parent")
                 return None
@@ -855,7 +854,8 @@ def accept_txn(serialized_txn: str):
             send_to_peer(txn, peer)
 
 
-def connect_block(block: Union[str, Block]) -> Union[None, Block]:
+def connect_block(block: Union[str, Block],
+                  check_reorg=True) -> Union[None, Block]:
     """Accept a block and return the chain index we append it to."""
     try:
         block, chain_idx = validate_block(block)
@@ -866,7 +866,8 @@ def connect_block(block: Union[str, Block]) -> Union[None, Block]:
             orphan_blocks.append(e.to_orphan)
         return None
 
-    if find_block(block.id)[0]:  # Already seen it.
+    if find_block(block.id, active_chain)[0]:  # Already seen it.
+        logger.debug(f'ignore block already seen: {block.id}')
         return None
 
     logger.info(f'connecting block {block.id} to chain {chain_idx}')
@@ -883,7 +884,7 @@ def connect_block(block: Union[str, Block]) -> Union[None, Block]:
         for i, txout in enumerate(tx.txouts):
             add_to_utxo(txout, tx, i, tx.is_coinbase, len(chain))
 
-    if reorg_if_necessary() or chain_idx == ACTIVE_CHAIN_IDX:
+    if (check_reorg and reorg_if_necessary()) or chain_idx == ACTIVE_CHAIN_IDX:
         mine_interrupt.set()
         logger.info(
             f'block accepted '
@@ -896,29 +897,31 @@ def connect_block(block: Union[str, Block]) -> Union[None, Block]:
 
 
 @with_lock(chain_lock)
-def disconnect_block(block, chain=active_chain):
+def disconnect_block(block, chain=None):
+    chain = chain or active_chain
     assert block == chain[-1], "Block being disconnected must be tip."
 
     for tx in block.txns:
         mempool[tx.id] = tx
 
         for txin in tx.txins:
-            add_to_utxo(*_find_txout_for_txin(txin, chain))
-        for i in range(tx.txouts):
+            if txin.to_spend:  # Account for degenerate coinbase txins.
+                add_to_utxo(*_find_txout_for_txin(txin, chain))
+        for i in range(len(tx.txouts)):
             rm_from_utxo(tx.id, i)
 
-    chain.pop()
     logger.info(f'block {block.id} disconnected')
+    return chain.pop()
 
 
 def _find_txout_for_txin(txin, chain):
     """TODO: clean this garbage up."""
-    txid, tx_idx = txin.to_spend
+    txid, txout_idx = txin.to_spend
 
     for tx, block, height in txn_iterator(chain):
         if tx.id == txid:
-            txout = tx.txouts[tx_idx]
-            return (txout, tx, tx_idx, tx.is_coinbase, height)
+            txout = tx.txouts[txout_idx]
+            return (txout, tx, txout_idx, tx.is_coinbase, height)
 
 
 class GetBlocks(NamedTuple):
@@ -934,7 +937,7 @@ class GetBlocks(NamedTuple):
 
         with chain_lock:
             # Only reference our current active chain.
-            _, height, _ = find_block(self.from_blockid)
+            _, height, _ = find_block(self.from_blockid, active_chain)
 
         # If we don't recognize the requested hash as part of the active
         # chain, start at the genesis block.
@@ -955,7 +958,7 @@ class Inv(NamedTuple):
 
         if self.type == 'block':
             not_in_chain = [
-                b for b in self.payload if not find_block(b, chain=None)[0]]
+                b for b in self.payload if not find_block(b)[0]]
 
             if not not_in_chain:
                 return
@@ -983,6 +986,16 @@ class Balance(NamedTuple):
         sock.sendall(str(sum(i.value for i in my_coins)).encode())
 
 
+def make_txin(outpoint, txout):
+    sequence = 0
+    pk = verifying_key.to_string()
+    spend_msg = build_spend_message(outpoint, pk, sequence, [txout])
+
+    return TxIn(
+        to_spend=outpoint, unlock_pk=pk,
+        unlock_sig=signing_key.sign(spend_msg), sequence=sequence)
+
+
 class Send(NamedTuple):
     addr: str
     value: int
@@ -1000,21 +1013,8 @@ class Send(NamedTuple):
 
         txout = TxOut(value=self.value, to_address=self.addr)
 
-        def make_txin(coin):
-            sequence = 0
-            pk = verifying_key.to_string()
-            spend_msg = build_spend_message(
-                coin.outpoint, pk, sequence, [txout])
-
-            return TxIn(
-                to_spend=coin.outpoint,
-                unlock_pk=pk,
-                unlock_sig=signing_key.sign(spend_msg),
-                sequence=sequence,
-            )
-
         txn = Transaction(
-            txins=[make_txin(coin) for coin in selected],
+            txins=[make_txin(coin.outpoint, txout) for coin in selected],
             txouts=[txout])
 
         logger.info(f'submitting to network: {txn}')
