@@ -1,9 +1,11 @@
 import time
 
 import pytest
+import ecdsa
 
 import tinychain as t
 from tinychain import Block, TxIn, TxOut, Transaction
+from client import make_txin
 
 
 def test_merkle_trees():
@@ -78,21 +80,21 @@ def test_get_median_time_past():
 def test_dependent_txns_in_single_block():
     t.active_chain = []
     t.mempool = {}
-    t.connect_block(chain1[0])
-    t.connect_block(chain1[1])
+    assert t.connect_block(chain1[0]) == t.ACTIVE_CHAIN_IDX
+    assert t.connect_block(chain1[1]) == t.ACTIVE_CHAIN_IDX
 
     assert len(t.active_chain) == 2
     assert len(t.utxo_set) == 2
 
     utxo1 = t.utxo_set[list(t.utxo_set.keys())[0]]
     txout1 = TxOut(value=901, to_address=utxo1.to_address)
-    txin1 = t.make_txin(utxo1.outpoint, txout1)
+    txin1 = make_txin(utxo1.outpoint, txout1)
     txn1 = t.Transaction(txins=[txin1], txouts=[txout1], locktime=0)
 
     # Create a transaction that is dependent on the yet-unconfirmed transaction
     # above.
     txout2 = TxOut(value=9001, to_address=txout1.to_address)
-    txin2 = t.make_txin(t.OutPoint(txn1.id, 0), txout2)
+    txin2 = make_txin(t.OutPoint(txn1.id, 0), txout2)
     txn2 = t.Transaction(txins=[txin2], txouts=[txout2], locktime=0)
 
     # Assert that we don't accept this txn -- too early to spend the coinbase.
@@ -104,12 +106,12 @@ def test_dependent_txns_in_single_block():
     t.connect_block(chain1[2])
 
     # Now the coinbase has matured to spending.
-    t.accept_txn(txn1)
+    t.add_txn_to_mempool(txn1)
     assert txn1.id in t.mempool
 
     # In txn2, we're attempting to spend more than is available (9001 vs. 901).
 
-    assert not t.accept_txn(txn2)
+    assert not t.add_txn_to_mempool(txn2)
 
     with pytest.raises(t.TxnValidationError) as excinfo:
         t.validate_txn(txn2)
@@ -117,10 +119,10 @@ def test_dependent_txns_in_single_block():
 
     # Recreate the transaction with an acceptable value.
     txout2 = TxOut(value=901, to_address=txout1.to_address)
-    txin2 = t.make_txin(t.OutPoint(txn1.id, 0), txout2)
+    txin2 = make_txin(t.OutPoint(txn1.id, 0), txout2)
     txn2 = t.Transaction(txins=[txin2], txouts=[txout2], locktime=0)
 
-    t.accept_txn(txn2)
+    t.add_txn_to_mempool(txn2)
     assert txn2.id in t.mempool
 
     block = t.assemble_and_solve_block(t.my_address)
@@ -143,7 +145,11 @@ def test_pubkey_to_address():
 
 
 def test_reorg():
-    t.active_chain = list(chain1)
+    t.active_chain = []
+
+    for block in chain1:
+        assert t.connect_block(block) == t.ACTIVE_CHAIN_IDX
+
     t.side_branches = []
     t.mempool = {}
     t.utxo_set = {}
@@ -153,7 +159,7 @@ def test_reorg():
         assert t.active_chain == chain1
         assert t.mempool == {}
         assert [k.txid[:6] for k in t.utxo_set] == [
-            '8b7bfc', '844923', 'd07b55']
+            '8b7bfc', 'b8a642', '6708b9']
 
     assert len(t.utxo_set) == 3
 
@@ -200,7 +206,7 @@ def test_reorg():
     assert t.side_branches == [chain2[1:3], chain1[1:]]
     assert t.mempool == {}
     assert [k.txid[:6] for k in t.utxo_set] == [
-        '8b7bfc', '844923', 'd07b55', '8efce2', 'd7a432']
+        '8b7bfc', 'b8a642', '6708b9', '543683', '53f3c1']
 
 
 def _add_to_utxo_for_chain(chain):
@@ -210,21 +216,22 @@ def _add_to_utxo_for_chain(chain):
                 t.add_to_utxo(txout, tx, i, tx.is_coinbase, len(chain))
 
 
-signing_key = t.get_signing_key(
-    b'\xf1\xad2y\xbf\xa2x\xabn\xfbO\x98\xf7\xa7\xb4\xc0\xf4fOzX\xbf\xf6\\\xd2\xcb-\x1d:0 \xa7')
+signing_key = ecdsa.SigningKey.from_string(
+    b'\xf1\xad2y\xbf\xa2x\xabn\xfbO\x98\xf7\xa7\xb4\xc0\xf4fOzX\xbf\xf6\\\xd2\xcb-\x1d:0 \xa7',
+    curve=ecdsa.SECP256k1)
 
 chain1 = [
-    Block(version=0, prev_block_hash=None, merkle_hash='7118894203235a955a908c0abfc6d8fe6edec47b0a04ce1bf7263da3b4366d22', timestamp=1501646462, bits=22, nonce=1779478, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'0', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')], locktime=None)]),
-    Block(version=0, prev_block_hash='000003538ba7723b29ef6073b129ba2a6fac058e3fff0ba245c43b4f2a5d30dc', merkle_hash='e74798a868c8d48a5eca5e726ccc1c80bb7c8ea563f447097ce343180ab59b3c', timestamp=1501646469, bits=22, nonce=1542197, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'1', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')], locktime=None)]),
-    Block(version=0, prev_block_hash='000002cc66275ef0c4b3b06313d0373a221ee3dc101b966868524039d52bb782', merkle_hash='abaaf9210225fabd4317133ec2b69f30fcc28f51a5f8e891170cf7362150b34e', timestamp=1501646476, bits=22, nonce=296233, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'2', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')], locktime=None)])
+    Block(version=0, prev_block_hash=None, merkle_hash='7118894203235a955a908c0abfc6d8fe6edec47b0a04ce1bf7263da3b4366d22', timestamp=1501821412, bits=24, nonce=10126761, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'0', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')], locktime=None)]),
+    Block(version=0, prev_block_hash='000000154275885a72c004d02aaa9524fc0c4896aef0b0f3bcde2de38f9be561', merkle_hash='27661bd9b23552832becf6c18cb6035a3d77b4e66b5520505221a93922eb82f2', timestamp=1501826444, bits=24, nonce=22488415, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'1', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='1Piq91dFUqSb7tdddCWvuGX5UgdzXeoAwA')], locktime=None)]),
+    Block(version=0, prev_block_hash='00000095f785bc8fbd6007b36c2f1c414d66db930e2e7354076c035c8f92700b', merkle_hash='031f45ad7b5ddf198f7dfa88f53c0262fb14c850c5c1faf506258b9dcad32aef', timestamp=1501826556, bits=24, nonce=30715680, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'2', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='1Piq91dFUqSb7tdddCWvuGX5UgdzXeoAwA')], locktime=None)])
 ]
 
 chain2 = [
-    Block(version=0, prev_block_hash=None, merkle_hash='7118894203235a955a908c0abfc6d8fe6edec47b0a04ce1bf7263da3b4366d22', timestamp=1501646462, bits=22, nonce=1779478, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'0', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')], locktime=None)]),
-    Block(version=0, prev_block_hash='000003538ba7723b29ef6073b129ba2a6fac058e3fff0ba245c43b4f2a5d30dc', merkle_hash='e74798a868c8d48a5eca5e726ccc1c80bb7c8ea563f447097ce343180ab59b3c', timestamp=1501646698, bits=22, nonce=6337297, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'1', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')], locktime=None)]),
-    Block(version=0, prev_block_hash='0000029ba4ef0015f00932e6b959a2ab6b27863fcd119d3b41faf041e18c90fe', merkle_hash='abaaf9210225fabd4317133ec2b69f30fcc28f51a5f8e891170cf7362150b34e', timestamp=1501646727, bits=22, nonce=739810, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'2', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')], locktime=None)]),
-    Block(version=0, prev_block_hash='000002e5e363610b1185ffaa6724c30a1dee180d750933605311b0a5d4dfb1aa', merkle_hash='8fa1b95226bc243b950dd213d45d874eab33b42cc63da5bdf3fee3ba89225a60', timestamp=1501646730, bits=22, nonce=1816826, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'3', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')], locktime=None)]),
-    Block(version=0, prev_block_hash='0000012c30fcfd60c5f7185d86ce2f0c017d7d77a04cacb849c704f672f01504', merkle_hash='6f0119a3032ed8dc1f288043e9382c51811780c05ec60ef4e0e5faa5396e6869', timestamp=1501646738, bits=22, nonce=2572466, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'4', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')], locktime=None)]),
+    Block(version=0, prev_block_hash=None, merkle_hash='7118894203235a955a908c0abfc6d8fe6edec47b0a04ce1bf7263da3b4366d22', timestamp=1501821412, bits=24, nonce=10126761, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'0', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')], locktime=None)]),
+    Block(version=0, prev_block_hash='000000154275885a72c004d02aaa9524fc0c4896aef0b0f3bcde2de38f9be561', merkle_hash='27661bd9b23552832becf6c18cb6035a3d77b4e66b5520505221a93922eb82f2', timestamp=1501826757, bits=24, nonce=25773772, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'1', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='1Piq91dFUqSb7tdddCWvuGX5UgdzXeoAwA')], locktime=None)]),
+    Block(version=0, prev_block_hash='000000e4785f0f384d13e24caaddcf6723ee008d6a179428ce9246e1b32e3b2c', merkle_hash='031f45ad7b5ddf198f7dfa88f53c0262fb14c850c5c1faf506258b9dcad32aef', timestamp=1501826872, bits=24, nonce=16925076, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'2', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='1Piq91dFUqSb7tdddCWvuGX5UgdzXeoAwA')], locktime=None)]),
+    Block(version=0, prev_block_hash='000000a1698495a3b125d9cd08837cdabffa192639588cdda8018ed8f5af3f8c', merkle_hash='dbf593cf959b3a03ea97bbeb7a44ee3f4841b338d5ceaa5705b637c853c956ef', timestamp=1501826949, bits=24, nonce=12052237, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'3', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='1Piq91dFUqSb7tdddCWvuGX5UgdzXeoAwA')], locktime=None)]),
+    Block(version=0, prev_block_hash='000000ef44dd5a56c89a43b9cff28e51e5fd91624be3a2de722d864ae4f6a853', merkle_hash='a3a55fe5e9f9e5e3282333ac4d149fd186f157a3c1d2b2e04af78c20a519f6b9', timestamp=1501827000, bits=24, nonce=752898, txns=[Transaction(txins=[TxIn(to_spend=None, unlock_sig=b'4', unlock_pk=None, sequence=0)], txouts=[TxOut(value=5000000000, to_address='1Piq91dFUqSb7tdddCWvuGX5UgdzXeoAwA')], locktime=None)])
 ]
 
 # Make this chain invalid.

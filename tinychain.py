@@ -1,56 +1,57 @@
 #!/usr/bin/env python3
 """
-tinychain
+⛼  tinychain
 
-Usage:
-  tinychain serve
-  tinychain send <addr> <amount>
+  putting the rough in "rough consensus"
 
-Options:
-  -h --help   Show this screen.
-  --version   Show version.
 
-Notes:
+Some terminology:
 
-- Where sensible, I've used naming which corresponds to bitcoin codebase
-  equivalents. This breaks with Python convention but hopefully it makes for
-  easier greping through bitcoin should you get curious.
+- Chain: an ordered list of Blocks, each of which refers to the last and
+      cryptographically preserves a history of Transactions.
 
-Unrealistic simplifications:
+- Transaction (or tx or txn): a list of inputs (i.e. past outputs being spent)
+    and outputs which declare value assigned to the hash of a public key.
+
+- PoW (proof of work): the solution to a puzzle which allows the acceptance
+    of an additional Block onto the chain.
+
+- Reorg: chain reorganization. When a side branch overtakes the main chain.
+
+
+An incomplete list of unrealistic simplifications:
 
 - Byte encoding and endianness are very important when serializing a
   data structure to be hashed in Bitcoin and are not reproduced
   faithfully here. In fact, serialization of any kind here is slipshod and
-  in many cases relies on implicit expectations about Python builtin
-  __repr__ methods.
-  See: https://en.bitcoin.it/wiki/Protocol_documentation
+  in many cases relies on implicit expectations about Python JSON
+  serialization.
 
-- Block `bit` targets are considerably simplified here.
-  See: https://bitcoin.org/en/developer-reference#target-nbits
-
-- No UTXO set.
-
-- Transaction types limited to P2PKH.
+- Transaction types are limited to P2PKH.
 
 - Initial Block Download eschews `getdata` and instead returns block payloads
   directly in `inv`.
 
-Some shorthand:
+- Peer "discovery" is done through environment variable hardcoding. In
+  bitcoin core, this is done with DNS seeds.
+  See https://bitcoin.stackexchange.com/a/3537/56368
 
-- PoW: proof of work
-- Tx: transaction
 
 Resources:
 
 - https://en.bitcoin.it/wiki/Protocol_rules
+- https://en.bitcoin.it/wiki/Protocol_documentation
+- https://bitcoin.org/en/developer-guide
+- https://github.com/bitcoinbook/bitcoinbook/blob/second_edition/ch06.asciidoc
+
 
 TODO:
 
-- reorg utxo maintenance
-- write chain to disk
-- keep the mempool heap sorted
+- persist chain to disk
 - deal with orphan blocks
-- replace-by-fee
+- keep the mempool heap sorted by fee
+- make use of Transaction.locktime
+? make use of TxIn.sequence; i.e. replace-by-fee
 
 """
 import binascii
@@ -69,32 +70,31 @@ from typing import (
     Callable)
 
 import ecdsa
-from docopt import docopt
 from base58 import b58encode_check
 
 
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='[%(asctime)s][%(module)s:%(lineno)d] %(levelname)s %(message)s')
+    level=getattr(logging, os.environ.get('TC_LOG_LEVEL', 'INFO')),
+    format=(
+        '[%(relativeCreated)s][%(module)s:%(lineno)d] %(levelname)s '
+        '%(message)s'))
 logger = logging.getLogger(__name__)
 
 
 class Params:
+    # The infamous max block size.
     MAX_BLOCK_SERIALIZED_SIZE = 1000000  # bytes = 1MB
 
     # Coinbase transaction outputs can be spent after this many blocks have
     # elapsed since being mined.
-    # XXX is "100" in core.
     #
+    # This is "100" in bitcoin core.
     COINBASE_MATURITY = 2
 
-    # Accept blocks which timestamped as being from the future up to this
-    # amount.
+    # Accept blocks timestamped as being from the future, up to this amount.
     MAX_FUTURE_BLOCK_TIME = (60 * 60 * 2)
 
-    # The number of Belushis per coin.
-    #
-    # #bitcoin-name: COIN
+    # The number of Belushis per coin. #realname COIN
     BELUSHIS_PER_COIN = int(100e6)
 
     TOTAL_COINS = 21_000_000
@@ -105,7 +105,7 @@ class Params:
     # The duration we want to pass between blocks being found, in seconds.
     # This is lower than Bitcoin's configuation (10 * 60).
     #
-    # #bitcoin-name: PowTargetSpacing
+    # #realname PowTargetSpacing
     TIME_BETWEEN_BLOCKS_IN_SECS_TARGET = 1 * 60
 
     # The number of seconds we want a difficulty period to last.
@@ -113,25 +113,26 @@ class Params:
     # Note that this differs considerably from the behavior in Bitcoin, which
     # is configured to target difficulty periods of (10 * 2016) minutes.
     #
-    # #bitcoin-name: PowTargetTimespan
+    # #realname PowTargetTimespan
     DIFFICULTY_PERIOD_IN_SECS_TARGET = (60 * 60 * 10)
 
     # After this number of blocks are found, adjust difficulty.
     #
-    # #bitcoin-name DifficultyAdjustmentInterval
+    # #realname DifficultyAdjustmentInterval
     DIFFICULTY_PERIOD_IN_BLOCKS = (
         DIFFICULTY_PERIOD_IN_SECS_TARGET / TIME_BETWEEN_BLOCKS_IN_SECS_TARGET)
 
-    INITIAL_DIFFICULTY_BITS = 22
+    # The number of right-shifts applied to 2 ** 256 in order to create the
+    # initial difficulty target necessary for mining a block.
+    INITIAL_DIFFICULTY_BITS = 24
 
     # The number of blocks after which the mining subsidy will halve.
     #
-    # #bitcoin-name: SubsidyHalvingInterval
+    # #realname SubsidyHalvingInterval
     HALVE_SUBSIDY_AFTER_BLOCKS_NUM = 210_000
 
 
-# Used to represent the specific output (since a transaction can have many
-# outputs) within a transaction.
+# Used to represent the specific output within a transaction.
 OutPoint = NamedTuple('OutPoint', [('txid', str), ('txout_idx', int)])
 
 
@@ -174,8 +175,7 @@ class UnspentTxOut(NamedTuple):
     height: int
 
     @property
-    def outpoint(self):
-        return OutPoint(self.txid, self.txout_idx)
+    def outpoint(self): return OutPoint(self.txid, self.txout_idx)
 
 
 class Transaction(NamedTuple):
@@ -235,7 +235,7 @@ class Block(NamedTuple):
     timestamp: int
 
     # The difficulty target; i.e. the hash of this block header must be under
-    # this value to consider work proved.
+    # (2 ** 256 >> bits) to consider work proved.
     bits: int
 
     # The value that's incremented in an attempt to get the block header to
@@ -245,13 +245,16 @@ class Block(NamedTuple):
     txns: Iterable[Transaction]
 
     def header(self, nonce=None) -> str:
+        """
+        This is hashed in an attempt to discover a nonce under the difficulty
+        target.
+        """
         return (
             f'{self.version}{self.prev_block_hash}{self.merkle_hash}'
             f'{self.timestamp}{self.bits}{nonce or self.nonce}')
 
     @property
-    def id(self) -> str:
-        return sha256d(self.header())
+    def id(self) -> str: return sha256d(self.header())
 
 
 # Chain
@@ -259,16 +262,19 @@ class Block(NamedTuple):
 
 genesis_block = Block(
     version=0, prev_block_hash=None,
-    merkle_hash='7118894203235a955a908c0abfc6d8fe6edec47b0a04ce1bf7263da3b4366d22',  # noqa
-    timestamp=1501646462, bits=22, nonce=1779478,
+    merkle_hash=(
+        '7118894203235a955a908c0abfc6d8fe6edec47b0a04ce1bf7263da3b4366d22'),
+    timestamp=1501821412, bits=24, nonce=10126761,
     txns=[Transaction(
-        txins=[TxIn(to_spend=None, unlock_sig=b'0', unlock_pk=None, sequence=0)],  # noqa
-        txouts=[TxOut(value=5000000000, to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')],  # noqa
-        locktime=None)])
+        txins=[TxIn(
+            to_spend=None, unlock_sig=b'0', unlock_pk=None, sequence=0)],
+        txouts=[TxOut(
+            value=5000000000,
+            to_address='143UVyz7ooiAv1pMqbwPPpnH4BV9ifJGFF')], locktime=None)])
 
 # The highest proof-of-work, valid blockchain.
 #
-# #bitcoin-name: chainActive
+# #realname chainActive
 active_chain: Iterable[Block] = [genesis_block]
 
 # Branches off of the main chain.
@@ -290,17 +296,12 @@ def with_lock(lock):
 
 orphan_blocks: Iterable[Block] = []
 
-# Used to signify the active chain in `find_block`.
+# Used to signify the active chain in `locate_block`.
 ACTIVE_CHAIN_IDX = 0
 
 
 @with_lock(chain_lock)
-def get_current_height():
-    return len(active_chain)
-
-
-def idx_to_chain(idx):
-    return active_chain if idx == ACTIVE_CHAIN_IDX else side_branches[idx - 1]
+def get_current_height(): return len(active_chain)
 
 
 @with_lock(chain_lock)
@@ -310,22 +311,8 @@ def txn_iterator(chain):
         for height, block in enumerate(chain) for txn in block.txns)
 
 
-def txin_iterator(chain):
-    return (
-        (txin, height)
-        for txn, _, height in txn_iterator(chain) for txin in txn.txins)
-
-
 @with_lock(chain_lock)
-def get_height(block_hash: str) -> int:
-    for i, block in enumerate(active_chain[::-1]):
-        if block.id == block_hash:
-            return i
-    return -1
-
-
-@with_lock(chain_lock)
-def find_block(block_hash: str, chain=None) -> (Block, int, int):
+def locate_block(block_hash: str, chain=None) -> (Block, int, int):
     chains = [chain] if chain else [active_chain, *side_branches]
 
     for chain_idx, chain in enumerate(chains):
@@ -335,18 +322,78 @@ def find_block(block_hash: str, chain=None) -> (Block, int, int):
     return (None, None, None)
 
 
-utxo_set: Mapping[OutPoint, UnspentTxOut] = {}
+@with_lock(chain_lock)
+def connect_block(block: Union[str, Block],
+                  check_reorg=True) -> Union[None, Block]:
+    """Accept a block and return the chain index we append it to."""
+    if locate_block(block.id, active_chain)[0]:  # Already seen this block.
+        return None
+
+    try:
+        block, chain_idx = validate_block(block)
+    except BlockValidationError as e:
+        logger.exception('block %s failed validation', block.id)
+        if e.to_orphan:
+            logger.info(f"saw orphan block {block.id}")
+            orphan_blocks.append(e.to_orphan)
+        return None
+
+    if locate_block(block.id, active_chain)[0]:  # Already seen it.
+        logger.debug(f'ignore block already seen: {block.id}')
+        return None
+
+    logger.info(f'connecting block {block.id} to chain {chain_idx}')
+    chain = (active_chain if chain_idx == 0 else side_branches[chain_idx - 1])
+    chain.append(block)
+
+    # Remove txs from mempool
+    for tx in block.txns:
+        mempool.pop(tx.id, None)
+
+        if not tx.is_coinbase:
+            for txin in tx.txins:
+                rm_from_utxo(*txin.to_spend)
+        for i, txout in enumerate(tx.txouts):
+            add_to_utxo(txout, tx, i, tx.is_coinbase, len(chain))
+
+    if (check_reorg and reorg_if_necessary()) or chain_idx == ACTIVE_CHAIN_IDX:
+        mine_interrupt.set()
+        logger.info(
+            f'block accepted '
+            f'height={len(active_chain) - 1} txns={len(block.txns)}')
+
+    for peer in peer_hostnames:
+        send_to_peer(block, peer)
+
+    return chain_idx
 
 
-def add_to_utxo(txout, tx, idx, is_coinbase, height):
-    utxo = UnspentTxOut(
-        *txout,
-        txid=tx.id, txout_idx=idx, is_coinbase=is_coinbase, height=height)
-    utxo_set[utxo.outpoint] = utxo
+@with_lock(chain_lock)
+def disconnect_block(block, chain=None):
+    chain = chain or active_chain
+    assert block == chain[-1], "Block being disconnected must be tip."
+
+    for tx in block.txns:
+        mempool[tx.id] = tx
+
+        # Restore UTXO set to what it was before this block.
+        for txin in tx.txins:
+            if txin.to_spend:  # Account for degenerate coinbase txins.
+                add_to_utxo(*find_txout_for_txin(txin, chain))
+        for i in range(len(tx.txouts)):
+            rm_from_utxo(tx.id, i)
+
+    logger.info(f'block {block.id} disconnected')
+    return chain.pop()
 
 
-def rm_from_utxo(txid, txout_idx):
-    del utxo_set[OutPoint(txid, txout_idx)]
+def find_txout_for_txin(txin, chain):
+    txid, txout_idx = txin.to_spend
+
+    for tx, block, height in txn_iterator(chain):
+        if tx.id == txid:
+            txout = tx.txouts[txout_idx]
+            return (txout, tx, txout_idx, tx.is_coinbase, height)
 
 
 @with_lock(chain_lock)
@@ -357,7 +404,7 @@ def reorg_if_necessary() -> bool:
     # TODO should probably be using `chainwork` for the basis of
     # comparison here.
     for i, chain in enumerate(frozen_side_branches, 1):
-        fork_block, fork_idx, _ = find_block(
+        fork_block, fork_idx, _ = locate_block(
             chain[0].prev_block_hash, active_chain)
         active_height = len(active_chain)
         branch_height = len(chain) + fork_idx
@@ -417,20 +464,52 @@ def get_median_time_past(num_last_blocks: int) -> int:
     return last_n_blocks[len(last_n_blocks) // 2].timestamp
 
 
+# UTXO set
+# ----------------------------------------------------------------------------
+
+utxo_set: Mapping[OutPoint, UnspentTxOut] = {}
+
+
+def add_to_utxo(txout, tx, idx, is_coinbase, height):
+    utxo = UnspentTxOut(
+        *txout,
+        txid=tx.id, txout_idx=idx, is_coinbase=is_coinbase, height=height)
+    utxo_set[utxo.outpoint] = utxo
+
+
+def rm_from_utxo(txid, txout_idx):
+    del utxo_set[OutPoint(txid, txout_idx)]
+
+
+def find_utxo_in_list(txin, txns) -> UnspentTxOut:
+    txid, txout_idx = txin.to_spend
+    try:
+        txout = [t for t in txns if t.id == txid][0].txouts[txout_idx]
+    except Exception:
+        return None
+
+    return UnspentTxOut(
+        *txout, txid=txid, is_coinbase=False, height=-1, txout_idx=txout_idx)
+
+
 # Proof of work
 # ----------------------------------------------------------------------------
 
 def get_next_work_required(prev_block_hash: str) -> int:
+    """
+    Based on the chain, return the number of difficulty bits the next block
+    must solve.
+    """
     if not prev_block_hash:
         return Params.INITIAL_DIFFICULTY_BITS
 
-    (prev_block, prev_height, _) = find_block(prev_block_hash)
+    (prev_block, prev_height, _) = locate_block(prev_block_hash)
 
     if (prev_height + 1) % Params.DIFFICULTY_PERIOD_IN_BLOCKS != 0:
         return prev_block.bits
 
     with chain_lock:
-        # #bitcoin-name: CalculateNextWorkRequired
+        # #realname CalculateNextWorkRequired
         period_start_block = active_chain[max(
             prev_height - (Params.DIFFICULTY_PERIOD_IN_BLOCKS - 1), 0)]
 
@@ -447,6 +526,9 @@ def get_next_work_required(prev_block_hash: str) -> int:
 
 
 def assemble_and_solve_block(pay_coinbase_to_addr, txns=None):
+    """
+    Construct a Block by pulling transactions from the mempool, then mine it.
+    """
     with chain_lock:
         prev_block_hash = active_chain[-1].id if active_chain else None
 
@@ -475,7 +557,11 @@ def assemble_and_solve_block(pay_coinbase_to_addr, txns=None):
     return mine(block)
 
 
-def calculate_fees(block):
+def calculate_fees(block) -> int:
+    """
+    Given the txns in a Block, subtract the amount of coin output from the
+    inputs. This is kept as a reward by the miner.
+    """
     fee = 0
 
     def utxo_from_block(txin):
@@ -535,24 +621,22 @@ def mine_forever():
 
         if block:
             connect_block(block)
+            logger.info(active_chain)
 
 
 # Validation
 # ----------------------------------------------------------------------------
 
 
-def validate_txn(txn: Union[Transaction, str],
+def validate_txn(txn: Transaction,
                  as_coinbase: bool = False,
                  siblings_in_block: Iterable[Transaction] = None,
                  allow_utxo_from_mempool: bool = True,
                  ) -> Transaction:
-    if not isinstance(txn, Transaction):
-        try:
-            txn = deserialize(txn)
-        except Exception:
-            logger.exception(f"Couldn't deserialize transaction {txn}")
-            raise TxnValidationError('Could not deserialize')
-
+    """
+    Validate a single transaction. Used in various contexts, so the
+    parameters facilitate different uses.
+    """
     txn.validate_basics(as_coinbase=as_coinbase)
 
     available_to_spend = 0
@@ -609,21 +693,14 @@ def validate_signature_for_spend(txin, utxo: UnspentTxOut, txn):
 
 
 def build_spend_message(to_spend, pk, sequence, txouts) -> bytes:
-    # TODO Double check that this is ~roughly~ equivalent to SIGHASH_ALL.
+    """This should be ~roughly~ equivalent to SIGHASH_ALL."""
     return sha256d(
         serialize(to_spend) + str(sequence) +
         binascii.hexlify(pk).decode() + serialize(txouts)).encode()
 
 
 @with_lock(chain_lock)
-def validate_block(block: Union[Block, str]) -> Block:
-    if not isinstance(block, Block):
-        try:
-            block = deserialize(block)
-        except Exception:
-            logger.exception(f"Couldn't deserialize block {block}")
-            raise BlockValidationError("Couldn't deserialize")
-
+def validate_block(block: Block) -> Block:
     if not block.txns:
         raise BlockValidationError('txns empty')
 
@@ -656,7 +733,7 @@ def validate_block(block: Union[Block, str]) -> Block:
         # This is the genesis block.
         prev_block_chain_idx = ACTIVE_CHAIN_IDX
     else:
-        prev_block, prev_block_height, prev_block_chain_idx = find_block(
+        prev_block, prev_block_height, prev_block_chain_idx = locate_block(
             block.prev_block_hash)
 
         if not prev_block:
@@ -684,27 +761,6 @@ def validate_block(block: Union[Block, str]) -> Block:
     return block, prev_block_chain_idx
 
 
-class BaseException(Exception):
-    def __init__(self, msg):
-        self.msg = msg
-
-
-class TxUnlockError(BaseException):
-    pass
-
-
-class TxnValidationError(BaseException):
-    def __init__(self, *args, to_orphan: Transaction = None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.to_orphan = to_orphan
-
-
-class BlockValidationError(BaseException):
-    def __init__(self, *args, to_orphan: Block = None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.to_orphan = to_orphan
-
-
 # mempool
 # ----------------------------------------------------------------------------
 
@@ -714,13 +770,6 @@ mempool: Dict[str, Transaction] = {}
 # Set of orphaned (i.e. has inputs referencing yet non-existent UTXOs)
 # transactions.
 orphan_txns: Iterable[Transaction] = []
-
-
-def find_with_txin_in_mempool(txin):
-    for txn in mempool.values():
-        if txin in txn.txins:
-            return txn
-    return None
 
 
 def find_utxo_in_mempool(txin) -> UnspentTxOut:
@@ -736,17 +785,6 @@ def find_utxo_in_mempool(txin) -> UnspentTxOut:
         *txout, txid=txid, is_coinbase=False, height=-1, txout_idx=idx)
 
 
-def find_utxo_in_list(txin, txns) -> UnspentTxOut:
-    txid, txout_idx = txin.to_spend
-    try:
-        txout = [t for t in txns if t.id == txid][0].txouts[txout_idx]
-    except Exception:
-        return None
-
-    return UnspentTxOut(
-        *txout, txid=txid, is_coinbase=False, height=-1, txout_idx=txout_idx)
-
-
 def select_from_mempool(block: Block) -> Block:
     """Fill a Block with transactions from the mempool."""
     added_to_block = set()
@@ -754,7 +792,7 @@ def select_from_mempool(block: Block) -> Block:
     def check_block_size(b) -> bool:
         return len(serialize(block)) < Params.MAX_BLOCK_SERIALIZED_SIZE
 
-    def add_to_block(block, txid) -> Block:
+    def try_add_to_block(block, txid) -> Block:
         if txid in added_to_block:
             return block
 
@@ -772,7 +810,7 @@ def select_from_mempool(block: Block) -> Block:
                 logger.debug(f"Couldn't find UTXO for {txin}")
                 return None
 
-            block = add_to_block(block, in_mempool.txid)
+            block = try_add_to_block(block, in_mempool.txid)
             if not block:
                 logger.debug(f"Couldn't add parent")
                 return None
@@ -787,7 +825,7 @@ def select_from_mempool(block: Block) -> Block:
             return block
 
     for txid in mempool:
-        newblock = add_to_block(block, txid)
+        newblock = try_add_to_block(block, txid)
 
         if check_block_size(newblock):
             block = newblock
@@ -795,6 +833,23 @@ def select_from_mempool(block: Block) -> Block:
             break
 
     return block
+
+
+def add_txn_to_mempool(txn: Transaction):
+    try:
+        txn = validate_txn(txn)
+    except TxnValidationError as e:
+        if e.to_orphan:
+            logger.info(f'txn {e.to_orphan.id} submitted as orphan')
+            orphan_txns.append(e.to_orphan)
+        else:
+            logger.exception(f'txn rejected')
+    else:
+        logger.info(f'txn {txn.id} added to mempool')
+        mempool[txn.id] = txn
+
+        for peer in peer_hostnames:
+            send_to_peer(txn, peer)
 
 
 # Merkle trees
@@ -829,196 +884,72 @@ def get_merkle_root(*leaves: Tuple[str]) -> MerkleNode:
 # Peer-to-peer
 # ----------------------------------------------------------------------------
 
-peerlist = [p for p in os.environ.get('TC_PEERLIST', '').split(',') if p]
+peer_hostnames = {p for p in os.environ.get('TC_PEERS', '').split(',') if p}
+
+# Signal when the initial block download has completed.
+ibd_done = threading.Event()
 
 
-def accept_txn(serialized_txn: str):
-    try:
-        txn = validate_txn(serialized_txn)
-    except TxnValidationError as e:
-        if e.to_orphan:
-            logger.info(f'txn {e.to_orphan.id} submitted as orphan')
-            orphan_txns.append(e.to_orphan)
-        else:
-            logger.exception(f'txn rejected')
-    else:
-        logger.info(f'txn {txn.id} added to mempool')
-        mempool[txn.id] = txn
-
-        for peer in peerlist:
-            send_to_peer(txn, peer)
-
-
-def connect_block(block: Union[str, Block],
-                  check_reorg=True) -> Union[None, Block]:
-    """Accept a block and return the chain index we append it to."""
-    try:
-        block, chain_idx = validate_block(block)
-    except BlockValidationError as e:
-        logger.exception('block %s failed validation', block.id)
-        if e.to_orphan:
-            logger.info(f"saw orphan block {block.id}")
-            orphan_blocks.append(e.to_orphan)
-        return None
-
-    if find_block(block.id, active_chain)[0]:  # Already seen it.
-        logger.debug(f'ignore block already seen: {block.id}')
-        return None
-
-    logger.info(f'connecting block {block.id} to chain {chain_idx}')
-    chain = idx_to_chain(chain_idx)
-    chain.append(block)
-
-    # Remove txs from mempool
-    for tx in block.txns:
-        mempool.pop(tx.id, None)
-
-        if not tx.is_coinbase:
-            for txin in tx.txins:
-                rm_from_utxo(*txin.to_spend)
-        for i, txout in enumerate(tx.txouts):
-            add_to_utxo(txout, tx, i, tx.is_coinbase, len(chain))
-
-    if (check_reorg and reorg_if_necessary()) or chain_idx == ACTIVE_CHAIN_IDX:
-        mine_interrupt.set()
-        logger.info(
-            f'block accepted '
-            f'height={len(active_chain) - 1} txns={len(block.txns)}')
-
-    for peer in peerlist:
-        send_to_peer(block, peer)
-
-    return chain_idx
-
-
-@with_lock(chain_lock)
-def disconnect_block(block, chain=None):
-    chain = chain or active_chain
-    assert block == chain[-1], "Block being disconnected must be tip."
-
-    for tx in block.txns:
-        mempool[tx.id] = tx
-
-        for txin in tx.txins:
-            if txin.to_spend:  # Account for degenerate coinbase txins.
-                add_to_utxo(*_find_txout_for_txin(txin, chain))
-        for i in range(len(tx.txouts)):
-            rm_from_utxo(tx.id, i)
-
-    logger.info(f'block {block.id} disconnected')
-    return chain.pop()
-
-
-def _find_txout_for_txin(txin, chain):
-    """TODO: clean this garbage up."""
-    txid, txout_idx = txin.to_spend
-
-    for tx, block, height in txn_iterator(chain):
-        if tx.id == txid:
-            txout = tx.txouts[txout_idx]
-            return (txout, tx, txout_idx, tx.is_coinbase, height)
-
-
-class GetBlocks(NamedTuple):
+class GetBlocksMsg(NamedTuple):  # Request blocks during initial sync
     """
     See https://bitcoin.org/en/developer-guide#blocks-first
-
     """
     from_blockid: str
 
-    def handle(self, sock, peername):
-        CHUNK_SIZE = 50
-        logger.debug("[p2p] recv getblocks from {peername[0]}")
+    CHUNK_SIZE = 50
 
-        with chain_lock:
-            # Only reference our current active chain.
-            _, height, _ = find_block(self.from_blockid, active_chain)
+    def handle(self, sock, peer_hostname):
+        logger.debug("[p2p] recv getblocks from {peer_hostname}")
+
+        _, height, _ = locate_block(self.from_blockid, active_chain)
 
         # If we don't recognize the requested hash as part of the active
         # chain, start at the genesis block.
         height = height or 1
 
         with chain_lock:
-            blocks = active_chain[height:(height + CHUNK_SIZE)]
+            blocks = active_chain[height:(height + self.CHUNK_SIZE)]
 
-        send_to_peer(Inv('block', blocks))
-
-
-class Inv(NamedTuple):
-    type: Union['block', 'tx']
-    payload: Iterable[str]
-
-    def handle(self, sock, peername):
-        logger.debug("[p2p] recv inv from {peername[0]}")
-
-        if self.type == 'block':
-            not_in_chain = [
-                b for b in self.payload if not find_block(b)[0]]
-
-            if not not_in_chain:
-                return
-
-            for block in not_in_chain:
-                connect_block(block)
-
-            with chain_lock:
-                send_to_peer(GetBlocks(active_chain[-1].id))
-
-        if self.type == 'tx':
-            for tx in (t for t in self.payload if t not in mempool):
-                mempool[tx.id] = tx
+        logger.debug(f"[p2p] sending {len(blocks)} to {peer_hostname}")
+        send_to_peer(InvMsg(blocks), peer_hostname)
 
 
-def find_utxos_for_address(addr):
-    return [utxo for utxo in utxo_set.values() if utxo.to_address == addr]
+class InvMsg(NamedTuple):  # Convey blocks to a peer who is doing initial sync
+    blocks: Iterable[str]
+
+    def handle(self, sock, peer_hostname):
+        logger.debug("[p2p] recv inv from {peer_hostname}")
+
+        new_blocks = [b for b in self.blocks if not locate_block(b.id)[0]]
+
+        if not new_blocks:
+            logger.debug('[p2p] initial block download complete')
+            ibd_done.set()
+            return
+
+        for block in new_blocks:
+            connect_block(block)
+
+        with chain_lock:
+            # "Recursive" call to continue the initial block sync.
+            send_to_peer(GetBlocksMsg(active_chain[-1].id))
 
 
-class Balance(NamedTuple):
-    addr: str
-
-    def handle(self, sock, peername):
-        my_coins = find_utxos_for_address(self.addr)
-        sock.sendall(str(sum(i.value for i in my_coins)).encode())
+class UTXOsMsg(NamedTuple):  # List all UTXOs
+    def handle(self, sock, peer_hostname):
+        sock.sendall(serialize(utxo_set).encode())
 
 
-def make_txin(outpoint, txout):
-    sequence = 0
-    pk = verifying_key.to_string()
-    spend_msg = build_spend_message(outpoint, pk, sequence, [txout])
-
-    return TxIn(
-        to_spend=outpoint, unlock_pk=pk,
-        unlock_sig=signing_key.sign(spend_msg), sequence=sequence)
-
-
-class Send(NamedTuple):
-    addr: str
-    value: int
-
-    def handle(self, sock, peername):
-        selected = set()
-        my_coins = list(sorted(
-            find_utxos_for_address(my_address),
-            key=lambda i: (i.value, i.height)))
-
-        for coin in my_coins:
-            selected.add(coin)
-            if sum(i.value for i in selected) > self.value:
-                break
-
-        txout = TxOut(value=self.value, to_address=self.addr)
-
-        txn = Transaction(
-            txins=[make_txin(coin.outpoint, txout) for coin in selected],
-            txouts=[txout])
-
-        logger.info(f'submitting to network: {txn}')
-        accept_txn(txn)
-
-
-class GetMempool(NamedTuple):
-    def handle(self, sock, peername):
+class MempoolMsg(NamedTuple):  # List the mempool
+    def handle(self, sock, peer_hostname):
         sock.sendall(serialize(list(mempool.keys())).encode())
+
+
+class AddPeerMsg(NamedTuple):
+    peer_hostname: str
+
+    def handle(self, sock, peer_hostname):
+        peer_hostnames.add(self.peer_hostname)
 
 
 def read_all_from_socket(req) -> object:
@@ -1032,32 +963,43 @@ def read_all_from_socket(req) -> object:
 
 
 def send_to_peer(data, peer=None):
-    peer = peer or random.choice(peerlist)
+    """Send a message to a (by default) random peer."""
+    peer = peer or random.choice(list(peer_hostnames))
 
     try:
-        with socket.create_connection(peer.split(':')) as s:
+        with socket.create_connection((peer, PORT)) as s:
             s.sendall(serialize(data).encode())
     except Exception:
         logger.exception(f'failed to send to peer {peer[0]}')
-        return False
-    return True
+
+
+class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    pass
 
 
 class TCPHandler(socketserver.BaseRequestHandler):
 
     def handle(self):
         data = read_all_from_socket(self.request)
+        peer_hostname = self.request.getpeername()[0]
+        peer_hostnames.add(peer_hostname)
 
         if hasattr(data, 'handle') and isinstance(data.handle, Callable):
-            data.handle(self.request, self.request.getpeername())
+            logger.info(f'received msg {data} from peer {peer_hostname}')
+            data.handle(self.request, peer_hostname)
         elif isinstance(data, Transaction):
-            accept_txn(data)
+            logger.info(f"received txn {data.id} from peer {peer_hostname}")
+            add_txn_to_mempool(data)
         elif isinstance(data, Block):
+            logger.info(f"received block {data.id} from peer {peer_hostname}")
             connect_block(data)
 
 
 # Wallet
 # ----------------------------------------------------------------------------
+
+WALLET_PATH = os.environ.get('TC_WALLET_PATH', 'wallet.dat')
+
 
 def pubkey_to_address(pubkey: bytes) -> str:
     if 'ripemd160' not in hashlib.algorithms_available:
@@ -1068,35 +1010,49 @@ def pubkey_to_address(pubkey: bytes) -> str:
     return b58encode_check(b'\x00' + ripe)
 
 
-def new_signing_key() -> ecdsa.SigningKey:
-    return ecdsa.SigningKey.generate(curve=ecdsa.SECP256k1)
+def init_wallet():
+    if os.path.exists(WALLET_PATH):
+        with open(WALLET_PATH, 'rb') as f:
+            signing_key = ecdsa.SigningKey.from_string(
+                f.read(), curve=ecdsa.SECP256k1)
+    else:
+        logger.info(f"generating new wallet: '{WALLET_PATH}'")
+        signing_key = ecdsa.SigningKey.generate(curve=ecdsa.SECP256k1)
+        with open('wallet.dat', 'wb') as f:
+            f.write(signing_key.to_string())
+
+    return signing_key
 
 
-def get_signing_key(privkey: bytes) -> ecdsa.SigningKey:
-    return ecdsa.SigningKey.from_string(privkey, curve=ecdsa.SECP256k1)
-
-
-def write_wallet_file(privkey):
-    with open('wallet.dat', 'wb') as f:
-        f.write(privkey)
-
-
-try:
-    with open('wallet.dat', 'rb') as f:
-        signing_key = get_signing_key(f.read())
-except Exception:
-    logger.exception("generating new signing key")
-    signing_key = new_signing_key()
-    write_wallet_file(signing_key.to_string())
-
-
+signing_key = init_wallet()
 verifying_key = signing_key.get_verifying_key()
 my_address = pubkey_to_address(verifying_key.to_string())
 logger.info(f"your address is {my_address}")
 
 
-# Uninteresting utilities
+# Misc. utilities
 # ----------------------------------------------------------------------------
+
+class BaseException(Exception):
+    def __init__(self, msg):
+        self.msg = msg
+
+
+class TxUnlockError(BaseException):
+    pass
+
+
+class TxnValidationError(BaseException):
+    def __init__(self, *args, to_orphan: Transaction = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.to_orphan = to_orphan
+
+
+class BlockValidationError(BaseException):
+    def __init__(self, *args, to_orphan: Block = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.to_orphan = to_orphan
+
 
 def serialize(obj) -> str:
     """NamedTuple-flavored serialization to JSON."""
@@ -1138,7 +1094,7 @@ def deserialize(serialized: str) -> object:
             o[k] = contents_to_objs(v)
 
             if k in bytes_keys:
-                o[k] = binascii.unhexlify(o[k])
+                o[k] = binascii.unhexlify(o[k]) if o[k] else o[k]
 
         return _type(**o)
 
@@ -1157,24 +1113,32 @@ def _chunks(l, n) -> Iterable[Iterable]:
     return (l[i:i + n] for i in range(0, len(l), n))
 
 
-class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    pass
+# Main
+# ----------------------------------------------------------------------------
+
+PORT = os.environ.get('TC_PORT', 9999)
 
 
-def main(args: dict):
-    if args['serve']:
-        workers = []
-        server = ThreadedTCPServer(('0.0.0.0', 9999), TCPHandler)
+def main():
+    workers = []
+    server = ThreadedTCPServer(('0.0.0.0', PORT), TCPHandler)
 
-        for fnc in (mine_forever, server.serve_forever):
-            worker = threading.Thread(target=fnc)
-            worker.daemon = True
-            worker.start()
-            workers.append(worker)
+    def start_worker(fnc):
+        workers.append(threading.Thread(target=fnc, daemon=True))
+        workers[-1].start()
 
-        logger.info('[p2p] listening on 9999')
-        [w.join() for w in workers]
+    logger.info(f'[p2p] listening on {PORT}')
+    start_worker(server.serve_forever)
+
+    if peer_hostnames:
+        logger.info(
+            f'start inital block download from {len(peer_hostnames)} peers')
+        send_to_peer(GetBlocksMsg(active_chain[-1].id))
+        ibd_done.wait(60.)  # Wait a maximum of 60 seconds for IBD to complete.
+
+    start_worker(mine_forever)
+    [w.join() for w in workers]
 
 
 if __name__ == '__main__':
-    main(docopt(__doc__, version='0.1'))
+    main()

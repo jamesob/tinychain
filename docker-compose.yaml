@@ -1,0 +1,12 @@
+version: "3"
+
+services:
+
+  node1:
+    build: .
+    image: tinychain
+
+  node2:
+    image: tinychain
+    environment:
+      TC_PEERS: 'node1'
