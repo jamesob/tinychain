@@ -13,13 +13,62 @@ a jumping-off point for programmers who are interested in (but don't have
 intimate familiarity with) Bitcoin or cryptocurrency. At the very least, it can
 be a piñata for protocol developers who actually know what they're doing.
 
+```
+$ cloc tinychain.py
+
+       1 text file.
+       1 unique file.
+       0 files ignored.
+
+http://cloc.sourceforge.net v 1.60  T=0.02 s (51.0 files/s, 60859.4 lines/s)
+-------------------------------------------------------------------------------
+Language                     files          blank        comment           code
+-------------------------------------------------------------------------------
+Python                           1            341            174            679
+-------------------------------------------------------------------------------
+```
+
 ## Quick start
 
-1. [Install Docker & docker-compose](https://www.docker.com/community-edition#/download)
-2. Clone this repo: `git clone git@github.com:jamesob/tinychain.git`
-3. Run `docker-compose up`.
+- [Install Docker & docker-compose](https://www.docker.com/community-edition#/download)
+- Clone this repo: `git clone git@github.com:jamesob/tinychain.git`
+- Run `docker-compose up`. This will spawn two tinychain nodes.
+- In another window, run `./bin/sync_wallets`. This brings the wallet data
+  from the Docker containers onto your host.
+    ```
+    $ ./bin/sync_wallets
 
-This will spawn two tinychain nodes.
+    Synced node1's wallet:
+    [2017-08-05 12:59:34,423][tinychain:1075] INFO your address is 1898KEjkziq9uRCzaVUUoBwzhURt4nrbP8
+     0.0 ⛼
+
+    Synced node2's wallet:
+    [2017-08-05 12:59:35,876][tinychain:1075] INFO your address is 15YxFVo4EuqvDJH8ey2bY352MVRVpH1yFD
+    0.0 ⛼
+    ```
+- Try running `./client.py balance -w wallet1.dat`; try it with the other
+  wallet file.
+    ```
+    $ ./client.py balance -w wallet2.dat
+
+    [2017-08-05 13:00:37,317][tinychain:1075] INFO your address is 15YxFVo4EuqvDJH8ey2bY352MVRVpH1yFD
+    0.0 ⛼
+    ```
+- Once you see a few blocks go by, try sending some money between the wallets
+    ```
+    $ ./client.py send -w wallet2.dat 1898KEjkziq9uRCzaVUUoBwzhURt4nrbP8 1337
+    
+    [2017-08-05 13:08:08,251][tinychain:1077] INFO your address is 1Q2fBbg8XnnPiv1UHe44f2x9vf54YKXh7C
+    [2017-08-05 13:08:08,361][client:105] INFO built txn Transaction(...)
+    [2017-08-05 13:08:08,362][client:106] INFO broadcasting txn 2aa89204456207384851a4bbf8bde155eca7fcf30b833495d5b0541f84931919
+    ```
+- Check on the status of the transaction
+    ```
+     $ ./client.py status e8f63eeeca32f9df28a3a62a366f63e8595cf70efb94710d43626ff4c0918a8a
+
+     [2017-08-05 13:09:21,489][tinychain:1077] INFO your address is 1898KEjkziq9uRCzaVUUoBwzhURt4nrbP8
+     Mined in 0000000726752f82af3d0f271fd61337035256051a9a1e5881e82d93d8e42d66 at height 5
+    ```
 
 
 ## What is Bitcoin?
@@ -114,14 +163,47 @@ human-readable and easy. We deserialize right into the `.*Msg` classes,
 each of which dictates how a particular RPC message is handled via 
 `.handle()`.
 
+
+### How can I add another RPC command to reveal more data from a node?
+
+Just add a `NamedTuple` subclass with a `handle()` method defined; it registers
+automatically. Mimic any existing `*Msg` class.
+
+ 
+### Why aren't my changes changing anything?
+
+Remember to rebuild the Docker container image when you make changes
+```
+docker-compose build && docker-compose up
+```
+
+### How do I run automated tests?
+
+```
+pip install -r requirements.test.txt
+py.test --cov test_tinychain.py
+```
+
+
 ### Is this yet another cryptocurrency created solely to Get Rich Quick™?
 
 A resounding Yes! (if you're dealing in the very illiquid currency of 
 education)
 
-This thing is basically worthless as a financial system, I have no illusions
-about that and neither should you. 
+Otherwise nah. This thing has 0 real-world value.
+
 
 ### What's with the logo?
 
 It's a shitty unicode Merkle tree. Give a guy a break here, this is freeware!
+
+
+### Do you take tips to Get Rich Quick™?
+
+Sure.
+
+![18ehgMUJBqKc2Eyi6WHiMwHFwA8kobYEhy](http://i.imgur.com/KAfUPA6.png)
+
+BTC: `18ehgMUJBqKc2Eyi6WHiMwHFwA8kobYEhy`
+
+Half of all tips will be donated to [an organization providing aid to Syrian refugees](http://www.moas.eu/).

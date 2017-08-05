@@ -489,6 +489,8 @@ def add_to_utxo(txout, tx, idx, is_coinbase, height):
     utxo = UnspentTxOut(
         *txout,
         txid=tx.id, txout_idx=idx, is_coinbase=is_coinbase, height=height)
+
+    logger.info(f'adding tx outpoint {utxo.outpoint} to utxo_set')
     utxo_set[utxo.outpoint] = utxo
 
 
