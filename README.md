@@ -77,7 +77,7 @@ of electricity. The most commonly known (but not sole) application of this is as
 a currency or store of value. If that sounds abstruse, general, and mindblowing,
 that's because it is.
 
-The atomic building block of Bitcoin is the `Transaction`, which assigns some
+In Bitcoin, value is recorded using a `Transaction`, which assigns some
 number of coins to an identity (via `TxOut`s) given some cryptographically
 unlocked `TxIn`s.  TxIns must always refer to previously created but unspent
 TxOuts.
