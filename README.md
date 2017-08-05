@@ -14,13 +14,10 @@ intimate familiarity with) Bitcoin or cryptocurrency. At the very least, it can
 be a piñata for protocol developers who actually know what they're doing.
 
 ```
-$ cloc tinychain.py
+ $ cloc --quiet tinychain.py
 
-       1 text file.
-       1 unique file.
-       0 files ignored.
 
-http://cloc.sourceforge.net v 1.60  T=0.02 s (51.0 files/s, 60859.4 lines/s)
+http://cloc.sourceforge.net v 1.60  T=0.02 s (65.9 files/s, 78661.7 lines/s)
 -------------------------------------------------------------------------------
 Language                     files          blank        comment           code
 -------------------------------------------------------------------------------
