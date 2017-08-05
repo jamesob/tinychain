@@ -148,10 +148,10 @@ For more eloquent, comprehensive descriptions of Bitcoin, see
 
 - Memory usage is egregious. Networking is a hack.
 
-- Satoshis are instead called Belushis because, well, who am I kidding anyway.
+- Satoshis are instead called Belushis because, well...
 
+<img align="right" width=110 src="http://static.rogerebert.com/uploads/blog_post/primary_image/interviews/why-john-belushi-died/primary_EB19840307PEOPLE70926001AR.jpg">
 
-<img align="right" width=250 src="http://static.rogerebert.com/uploads/blog_post/primary_image/interviews/why-john-belushi-died/primary_EB19840307PEOPLE70926001AR.jpg">
  
 
 ## Q&A
