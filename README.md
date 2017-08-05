@@ -70,7 +70,7 @@ Python                           1            341            174            679
 
 ## What is Bitcoin?
 
-In very brief terms that map to this code:
+In brief terms that map to this code...
 
 Bitcoin is a way of generating pseudo-anonymous, decentralized trust at the cost
 of electricity. The most commonly known (but not sole) application of this is as
