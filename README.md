@@ -29,6 +29,8 @@ Python                           1            341            174            679
 
 - [Install Docker & docker-compose](https://www.docker.com/community-edition#/download)
 - Clone this repo: `git clone git@github.com:jamesob/tinychain.git`
+- Grab Python dependencies locally: `pip install -r requirements.txt`
+  - Make sure you're in a Python3.6 environment: `virtualenv --python=3.6 venv`
 - Run `docker-compose up`. This will spawn two tinychain nodes.
 - In another window, run `./bin/sync_wallets`. This brings the wallet data
   from the Docker containers onto your host.
