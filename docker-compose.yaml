@@ -5,6 +5,8 @@ services:
   node1:
     build: .
     image: tinychain
+    ports:
+      - "9999:9999"
 
   node2:
     image: tinychain

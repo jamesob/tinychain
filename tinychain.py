@@ -75,9 +75,7 @@ from base58 import b58encode_check
 
 logging.basicConfig(
     level=getattr(logging, os.environ.get('TC_LOG_LEVEL', 'INFO')),
-    format=(
-        '[%(relativeCreated)s][%(module)s:%(lineno)d] %(levelname)s '
-        '%(message)s'))
+    format='[%(asctime)s][%(module)s:%(lineno)d] %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -324,9 +322,14 @@ def locate_block(block_hash: str, chain=None) -> (Block, int, int):
 
 @with_lock(chain_lock)
 def connect_block(block: Union[str, Block],
-                  check_reorg=True) -> Union[None, Block]:
+                  doing_reorg=False,
+                  ) -> Union[None, Block]:
     """Accept a block and return the chain index we append it to."""
-    if locate_block(block.id, active_chain)[0]:  # Already seen this block.
+    # Only exit early on already seen in active_chain when reorging.
+    search_chain = active_chain if doing_reorg else None
+
+    if locate_block(block.id, chain=search_chain)[0]:
+        logger.debug(f'ignore block already seen: {block.id}')
         return None
 
     try:
@@ -338,25 +341,32 @@ def connect_block(block: Union[str, Block],
             orphan_blocks.append(e.to_orphan)
         return None
 
-    if locate_block(block.id, active_chain)[0]:  # Already seen it.
-        logger.debug(f'ignore block already seen: {block.id}')
-        return None
+    # If `validate_block()` returned a non-existent chain index, we're
+    # creating a new side branch.
+    if chain_idx != ACTIVE_CHAIN_IDX and len(side_branches) < chain_idx:
+        logger.info(
+            f'creating a new side branch (idx {chain_idx}) '
+            f'for block {block.id}')
+        side_branches.append([])
 
     logger.info(f'connecting block {block.id} to chain {chain_idx}')
-    chain = (active_chain if chain_idx == 0 else side_branches[chain_idx - 1])
+    chain = (active_chain if chain_idx == ACTIVE_CHAIN_IDX else
+             side_branches[chain_idx - 1])
     chain.append(block)
 
-    # Remove txs from mempool
-    for tx in block.txns:
-        mempool.pop(tx.id, None)
+    # If we added to the active chain, perform upkeep on utxo_set and mempool.
+    if chain_idx == ACTIVE_CHAIN_IDX:
+        for tx in block.txns:
+            mempool.pop(tx.id, None)
 
-        if not tx.is_coinbase:
-            for txin in tx.txins:
-                rm_from_utxo(*txin.to_spend)
-        for i, txout in enumerate(tx.txouts):
-            add_to_utxo(txout, tx, i, tx.is_coinbase, len(chain))
+            if not tx.is_coinbase:
+                for txin in tx.txins:
+                    rm_from_utxo(*txin.to_spend)
+            for i, txout in enumerate(tx.txouts):
+                add_to_utxo(txout, tx, i, tx.is_coinbase, len(chain))
 
-    if (check_reorg and reorg_if_necessary()) or chain_idx == ACTIVE_CHAIN_IDX:
+    if (not doing_reorg and reorg_if_necessary()) or \
+            chain_idx == ACTIVE_CHAIN_IDX:
         mine_interrupt.set()
         logger.info(
             f'block accepted '
@@ -403,14 +413,17 @@ def reorg_if_necessary() -> bool:
 
     # TODO should probably be using `chainwork` for the basis of
     # comparison here.
-    for i, chain in enumerate(frozen_side_branches, 1):
+    for branch_idx, chain in enumerate(frozen_side_branches, 1):
         fork_block, fork_idx, _ = locate_block(
             chain[0].prev_block_hash, active_chain)
         active_height = len(active_chain)
         branch_height = len(chain) + fork_idx
 
         if branch_height > active_height:
-            reorged |= try_reorg(chain, i, fork_idx)
+            logger.info(
+                f'attempting reorg of idx {branch_idx} to active_chain: '
+                f'new height of {branch_height} (vs. {active_height})')
+            reorged |= try_reorg(chain, branch_idx, fork_idx)
 
     return reorged
 
@@ -433,13 +446,15 @@ def try_reorg(branch, branch_idx, fork_idx) -> bool:
     assert branch[0].prev_block_hash == active_chain[-1].id
 
     def rollback_reorg():
+        logger.info(f'reorg of idx {branch_idx} to active_chain failed')
         list(disconnect_to_fork())  # Force the gneerator to eval.
 
         for block in old_active:
-            assert connect_block(block, check_reorg=False) == ACTIVE_CHAIN_IDX
+            assert connect_block(block, doing_reorg=True) == ACTIVE_CHAIN_IDX
 
     for block in branch:
-        if connect_block(block, check_reorg=False) != ACTIVE_CHAIN_IDX:
+        connected_idx = connect_block(block, doing_reorg=True)
+        if connected_idx != ACTIVE_CHAIN_IDX:
             rollback_reorg()
             return False
 
@@ -546,6 +561,7 @@ def assemble_and_solve_block(pay_coinbase_to_addr, txns=None):
         block = select_from_mempool(block)
 
     fees = calculate_fees(block)
+    my_address = init_wallet()[2]
     coinbase_txn = Transaction.create_coinbase(
         my_address, (get_block_subsidy() + fees), len(active_chain))
     block = block._replace(txns=[coinbase_txn, *block.txns])
@@ -610,18 +626,19 @@ def mine(block):
     block = block._replace(nonce=nonce)
     duration = int(time.time() - start) or 0.001
     khs = (block.nonce // duration) // 1000
-    logger.info(f'block found! {duration} s - {khs} KH/s - {block.id}')
+    logger.info(
+        f'[mining] block found! {duration} s - {khs} KH/s - {block.id}')
 
     return block
 
 
 def mine_forever():
     while True:
+        my_address = init_wallet()[2]
         block = assemble_and_solve_block(my_address)
 
         if block:
             connect_block(block)
-            logger.info(active_chain)
 
 
 # Validation
@@ -723,9 +740,6 @@ def validate_block(block: Block) -> Block:
     if get_merkle_root_of_txns(block.txns).val != block.merkle_hash:
         raise BlockValidationError('Merkle hash invalid')
 
-    if get_next_work_required(block.prev_block_hash) != block.bits:
-        raise BlockValidationError('bits is incorrect')
-
     if block.timestamp <= get_median_time_past(11):
         raise BlockValidationError('timestamp too old')
 
@@ -748,6 +762,9 @@ def validate_block(block: Block) -> Block:
         # Prev. block found in active chain, but isn't tip => new fork.
         elif prev_block != active_chain[-1]:
             return block, prev_block_chain_idx + 1  # Non-existent
+
+    if get_next_work_required(block.prev_block_hash) != block.bits:
+        raise BlockValidationError('bits is incorrect')
 
     for txn in block.txns[1:]:
         try:
@@ -836,6 +853,10 @@ def select_from_mempool(block: Block) -> Block:
 
 
 def add_txn_to_mempool(txn: Transaction):
+    if txn.id in mempool:
+        logger.info(f'txn {txn.id} already seen')
+        return
+
     try:
         txn = validate_txn(txn)
     except TxnValidationError as e:
@@ -918,31 +939,39 @@ class InvMsg(NamedTuple):  # Convey blocks to a peer who is doing initial sync
     blocks: Iterable[str]
 
     def handle(self, sock, peer_hostname):
-        logger.debug("[p2p] recv inv from {peer_hostname}")
+        logger.info(f"[p2p] recv inv from {peer_hostname}")
 
         new_blocks = [b for b in self.blocks if not locate_block(b.id)[0]]
 
         if not new_blocks:
-            logger.debug('[p2p] initial block download complete')
+            logger.info('[p2p] initial block download complete')
             ibd_done.set()
             return
 
         for block in new_blocks:
             connect_block(block)
 
+        new_tip_id = active_chain[-1].id
+        logger.info(f'[p2p] continuing initial block download at {new_tip_id}')
+
         with chain_lock:
             # "Recursive" call to continue the initial block sync.
-            send_to_peer(GetBlocksMsg(active_chain[-1].id))
+            send_to_peer(GetBlocksMsg(new_tip_id))
 
 
-class UTXOsMsg(NamedTuple):  # List all UTXOs
+class GetUTXOsMsg(NamedTuple):  # List all UTXOs
     def handle(self, sock, peer_hostname):
-        sock.sendall(serialize(utxo_set).encode())
+        sock.sendall(encode_socket_data(list(utxo_set.items())))
 
 
-class MempoolMsg(NamedTuple):  # List the mempool
+class GetMempoolMsg(NamedTuple):  # List the mempool
     def handle(self, sock, peer_hostname):
-        sock.sendall(serialize(list(mempool.keys())).encode())
+        sock.sendall(encode_socket_data(list(mempool.keys())))
+
+
+class GetActiveChainMsg(NamedTuple):  # Get the active chain in its entirety.
+    def handle(self, sock, peer_hostname):
+        sock.sendall(encode_socket_data(list(active_chain)))
 
 
 class AddPeerMsg(NamedTuple):
@@ -954,23 +983,40 @@ class AddPeerMsg(NamedTuple):
 
 def read_all_from_socket(req) -> object:
     data = b''
-    while True:
-        got = req.recv(1024)
-        if not got:
-            break
-        data += got
-    return deserialize(data.decode())
+    # Our protocol is: first 4 bytes signify msg length.
+    msg_len = int(binascii.hexlify(req.recv(4) or b'\x00'), 16)
+
+    while msg_len > 0:
+        data += req.recv(1024)
+        msg_len -= 1024
+
+    return deserialize(data.decode()) if data else None
 
 
 def send_to_peer(data, peer=None):
     """Send a message to a (by default) random peer."""
     peer = peer or random.choice(list(peer_hostnames))
+    tries_left = 3
 
-    try:
-        with socket.create_connection((peer, PORT)) as s:
-            s.sendall(serialize(data).encode())
-    except Exception:
-        logger.exception(f'failed to send to peer {peer[0]}')
+    while tries_left > 0:
+        try:
+            with socket.create_connection((peer, PORT)) as s:
+                s.sendall(encode_socket_data(data))
+        except Exception:
+            logger.exception(f'failed to send to peer {peer}')
+            tries_left -= 1
+            time.sleep(2)
+        else:
+            break
+
+
+def int_to_8bytes(a: int) -> bytes: return binascii.unhexlify(f"{a:0{8}x}")
+
+
+def encode_socket_data(data: object) -> bytes:
+    """Our protocol is: first 4 bytes signify msg length."""
+    to_send = serialize(data).encode()
+    return int_to_8bytes(len(to_send)) + to_send
 
 
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -1010,24 +1056,25 @@ def pubkey_to_address(pubkey: bytes) -> str:
     return b58encode_check(b'\x00' + ripe)
 
 
-def init_wallet():
-    if os.path.exists(WALLET_PATH):
-        with open(WALLET_PATH, 'rb') as f:
+@lru_cache()
+def init_wallet(path=None):
+    path = path or WALLET_PATH
+
+    if os.path.exists(path):
+        with open(path, 'rb') as f:
             signing_key = ecdsa.SigningKey.from_string(
                 f.read(), curve=ecdsa.SECP256k1)
     else:
-        logger.info(f"generating new wallet: '{WALLET_PATH}'")
+        logger.info(f"generating new wallet: '{path}'")
         signing_key = ecdsa.SigningKey.generate(curve=ecdsa.SECP256k1)
-        with open('wallet.dat', 'wb') as f:
+        with open(path, 'wb') as f:
             f.write(signing_key.to_string())
 
-    return signing_key
+    verifying_key = signing_key.get_verifying_key()
+    my_address = pubkey_to_address(verifying_key.to_string())
+    logger.info(f"your address is {my_address}")
 
-
-signing_key = init_wallet()
-verifying_key = signing_key.get_verifying_key()
-my_address = pubkey_to_address(verifying_key.to_string())
-logger.info(f"your address is {my_address}")
+    return signing_key, verifying_key, my_address
 
 
 # Misc. utilities
@@ -1059,7 +1106,7 @@ def serialize(obj) -> str:
     def contents_to_primitive(o):
         if hasattr(o, '_asdict'):
             o = {**o._asdict(), '_type': type(o).__name__}
-        elif isinstance(o, list):
+        elif isinstance(o, (list, tuple)):
             return [contents_to_primitive(i) for i in o]
         elif isinstance(o, bytes):
             return binascii.hexlify(o).decode()
@@ -1141,4 +1188,5 @@ def main():
 
 
 if __name__ == '__main__':
+    signing_key, verifying_key, my_address = init_wallet()
     main()

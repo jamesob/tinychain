@@ -1,0 +1,6 @@
+__pycache__
+.cache
+.coverage
+.nvimlog
+htmlcov
+*.dat
