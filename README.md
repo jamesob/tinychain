@@ -4,7 +4,7 @@
 
 
 Tinychain is a pocket-sized implementation of Bitcoin. Its goal is to
-be the most compact, understandable, working incarnation of 
+be a compact, understandable, working incarnation of 
 [the Nakamoto consensus algorithm](https://bitcoin.org/bitcoin.pdf) at the
 expense of functionality, speed, and any real usefulness.
 
