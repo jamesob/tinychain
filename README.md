@@ -4,9 +4,9 @@
 
 
 Tinychain is a pocket-sized implementation of Bitcoin. Its goal is to
-be the most compact, understandable, working incarnation of 
+be a compact, understandable, working incarnation of 
 [the Nakamoto consensus algorithm](https://bitcoin.org/bitcoin.pdf) at the
-expense of functionality, speed, and any real usefulness.
+expense of advanced functionality, speed, and any real usefulness.
 
 I wrote it primarily to understand Bitcoin better, but hopefully it can serve as
 a jumping-off point for programmers who are interested in (but don't have
@@ -14,13 +14,10 @@ intimate familiarity with) Bitcoin or cryptocurrency. At the very least, it can
 be a piñata for protocol developers who actually know what they're doing.
 
 ```
-$ cloc tinychain.py
+ $ cloc --quiet tinychain.py
 
-       1 text file.
-       1 unique file.
-       0 files ignored.
 
-http://cloc.sourceforge.net v 1.60  T=0.02 s (51.0 files/s, 60859.4 lines/s)
+http://cloc.sourceforge.net v 1.60  T=0.02 s (65.9 files/s, 78661.7 lines/s)
 -------------------------------------------------------------------------------
 Language                     files          blank        comment           code
 -------------------------------------------------------------------------------
@@ -73,14 +70,14 @@ Python                           1            341            174            679
 
 ## What is Bitcoin?
 
-In very brief terms that map to this code:
+In brief terms that map to this code...
 
 Bitcoin is a way of generating pseudo-anonymous, decentralized trust at the cost
 of electricity. The most commonly known (but not sole) application of this is as
 a currency or store of value. If that sounds abstruse, general, and mindblowing,
 that's because it is.
 
-The atomic building block of Bitcoin is the `Transaction`, which assigns some
+In Bitcoin, value is recorded using a `Transaction`, which assigns some
 number of coins to an identity (via `TxOut`s) given some cryptographically
 unlocked `TxIn`s.  TxIns must always refer to previously created but unspent
 TxOuts.
@@ -102,14 +99,16 @@ normalize the time between block discovery.
 When a block is discovered, it creates a subsidy for the discoverer in the form
 of newly minted coins. The discoverer also collects fees from transactions
 included in the block, which are the value of inputs minus outputs. The block
-reward subsidy decreases logarithmically over time.
+reward subsidy decreases logarithmically over time. Eventually the subsidy 
+goes to zero and miners are incentivized to continue mining purely by a fee
+market.
 
 Nodes in the network are in a never-ending competition to mine and propagate the
 next block, and in doing so facilitate the recording of transaction history.
 Transactions are submitted to nodes and broadcast across the network, stored
 temporarily in `mempool` where they are queued for block inclusion.
 
-For more eloquent, comprehensive descriptions of Bitcoin, see
+For more comprehensive descriptions of Bitcoin, see
 
 - [Bitcoin: A Peer-to-Peer Electonic Cash System](https://bitcoin.org/bitcoin.pdf) 
   by Satoshi Nakamoto
@@ -163,6 +162,9 @@ human-readable and easy. We deserialize right into the `.*Msg` classes,
 each of which dictates how a particular RPC message is handled via 
 `.handle()`.
 
+### Why doesn't the client track coins we've spent but haven't confirmed yet?
+
+Yeah I know, the client sucks. I'll take a PR.
 
 ### How can I add another RPC command to reveal more data from a node?
 
