@@ -201,6 +201,9 @@ Otherwise nah. This thing has 0 real-world value.
 
 It's a shitty unicode Merkle tree. Give a guy a break here, this is freeware!
 
+### Where can I get more of you ranting?
+
+[@jamesob](https://twitter.com/jamesob)
 
 ### Do you take tips to Get Rich Quick™?
 
