@@ -112,7 +112,7 @@ temporarily in `mempool` where they are queued for block inclusion.
 
 For more comprehensive descriptions of Bitcoin, see
 
-- [Bitcoin: A Peer-to-Peer Electonic Cash System](https://bitcoin.org/bitcoin.pdf) 
+- [Bitcoin: A Peer-to-Peer Electronic Cash System](https://bitcoin.org/bitcoin.pdf) 
   by Satoshi Nakamoto
 - [Mastering Bitcoin](https://github.com/bitcoinbook/bitcoinbook/) by Andreas
   Antonopoulos
