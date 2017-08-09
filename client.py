@@ -51,9 +51,7 @@ def get_balance(args):
     Get the balance of a given address.
     """
     val = sum(i.value for i in find_utxos_for_address(args))
-
-    print(val) if args['--raw'] else print(
-        f"{val / t.Params.BELUSHIS_PER_COIN} ⛼ ")
+    print(val if args['--raw'] else f"{val / t.Params.BELUSHIS_PER_COIN} ⛼ ")
 
 
 def txn_status(args):
