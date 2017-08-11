@@ -16,8 +16,6 @@ be a piñata for protocol developers who actually know what they're doing.
 ```
  $ cloc --quiet tinychain.py
 
-
-http://cloc.sourceforge.net v 1.60  T=0.02 s (65.9 files/s, 78661.7 lines/s)
 -------------------------------------------------------------------------------
 Language                     files          blank        comment           code
 -------------------------------------------------------------------------------
