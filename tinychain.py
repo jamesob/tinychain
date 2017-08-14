@@ -997,6 +997,8 @@ def read_all_from_socket(req) -> object:
 
 def send_to_peer(data, peer=None):
     """Send a message to a (by default) random peer."""
+    global peer_hostnames
+
     peer = peer or random.choice(list(peer_hostnames))
     tries_left = 3
 
@@ -1009,7 +1011,10 @@ def send_to_peer(data, peer=None):
             tries_left -= 1
             time.sleep(2)
         else:
-            break
+            return
+
+    logger.info(f"[p2p] removing dead peer {peer}")
+    peer_hostnames = [x for x in peer_hostnames if x != peer]
 
 
 def int_to_8bytes(a: int) -> bytes: return binascii.unhexlify(f"{a:0{8}x}")
@@ -1181,7 +1186,7 @@ def main():
 
     if peer_hostnames:
         logger.info(
-            f'start inital block download from {len(peer_hostnames)} peers')
+            f'start initial block download from {len(peer_hostnames)} peers')
         send_to_peer(GetBlocksMsg(active_chain[-1].id))
         ibd_done.wait(60.)  # Wait a maximum of 60 seconds for IBD to complete.
 
