@@ -922,7 +922,7 @@ class GetBlocksMsg(NamedTuple):  # Request blocks during initial sync
     CHUNK_SIZE = 50
 
     def handle(self, sock, peer_hostname):
-        logger.debug("[p2p] recv getblocks from {peer_hostname}")
+        logger.debug(f"[p2p] recv getblocks from {peer_hostname}")
 
         _, height, _ = locate_block(self.from_blockid, active_chain)
 
@@ -1014,7 +1014,7 @@ def send_to_peer(data, peer=None):
             return
 
     logger.info(f"[p2p] removing dead peer {peer}")
-    peer_hostnames = [x for x in peer_hostnames if x != peer]
+    peer_hostnames = {x for x in peer_hostnames if x != peer}
 
 
 def int_to_8bytes(a: int) -> bytes: return binascii.unhexlify(f"{a:0{8}x}")
