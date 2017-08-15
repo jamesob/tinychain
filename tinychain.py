@@ -47,7 +47,6 @@ Resources:
 
 TODO:
 
-- persist chain to disk
 - deal with orphan blocks
 - keep the mempool heap sorted by fee
 - make use of Transaction.locktime
@@ -479,6 +478,32 @@ def get_median_time_past(num_last_blocks: int) -> int:
     return last_n_blocks[len(last_n_blocks) // 2].timestamp
 
 
+# Chain Persistance
+# ----------------------------------------------------------------------------
+
+CHAIN_PATH = os.environ.get('TC_CHAIN_PATH', 'chain.dat')
+
+@with_lock(chain_lock)
+def save_to_disk():
+    with open(CHAIN_PATH, "wb") as f:
+        logger.info(f"saving chain with {len(active_chain)} blocks")
+        f.write(encode_socket_data(list(active_chain)))
+
+@with_lock(chain_lock)
+def load_from_disk():
+    if not os.path.isfile(CHAIN_PATH):
+        return
+    try:
+        with open(CHAIN_PATH, "rb") as f:
+            msg_len = int(binascii.hexlify(f.read(4) or b'\x00'), 16)
+            new_blocks = deserialize(f.read(msg_len))
+            logger.info(f"loading chain from disk with {len(new_blocks)} blocks")
+            for block in new_blocks:
+                connect_block(block)
+    except Exception:
+        logger.exception('load chain failed, starting from genesis')
+
+
 # UTXO set
 # ----------------------------------------------------------------------------
 
@@ -641,6 +666,7 @@ def mine_forever():
 
         if block:
             connect_block(block)
+            save_to_disk()
 
 
 # Validation
@@ -907,7 +933,7 @@ def get_merkle_root(*leaves: Tuple[str]) -> MerkleNode:
 # Peer-to-peer
 # ----------------------------------------------------------------------------
 
-peer_hostnames = {p for p in os.environ.get('TC_PEERS', '').split(',') if p}
+peer_hostnames = {p for p in os.environ.get('TC_PEERS', 'tinychain.co').split(',') if p}
 
 # Signal when the initial block download has completed.
 ibd_done = threading.Event()
@@ -1174,6 +1200,8 @@ PORT = os.environ.get('TC_PORT', 9999)
 
 
 def main():
+    load_from_disk()
+
     workers = []
     server = ThreadedTCPServer(('0.0.0.0', PORT), TCPHandler)
 
