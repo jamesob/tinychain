@@ -1004,7 +1004,7 @@ def send_to_peer(data, peer=None):
 
     while tries_left > 0:
         try:
-            with socket.create_connection((peer, PORT)) as s:
+            with socket.create_connection((peer, PORT), timeout=1) as s:
                 s.sendall(encode_socket_data(data))
         except Exception:
             logger.exception(f'failed to send to peer {peer}')
