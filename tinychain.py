@@ -1015,8 +1015,9 @@ def read_all_from_socket(req) -> object:
     msg_len = int(binascii.hexlify(req.recv(4) or b'\x00'), 16)
 
     while msg_len > 0:
-        data += req.recv(1024)
-        msg_len -= 1024
+        tdat = req.recv(1024)
+        data += tdat
+        msg_len -= len(tdat)
 
     return deserialize(data.decode()) if data else None
 
