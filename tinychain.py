@@ -47,7 +47,6 @@ Resources:
 
 TODO:
 
-- persist chain to disk
 - deal with orphan blocks
 - keep the mempool heap sorted by fee
 - make use of Transaction.locktime
@@ -479,6 +478,32 @@ def get_median_time_past(num_last_blocks: int) -> int:
     return last_n_blocks[len(last_n_blocks) // 2].timestamp
 
 
+# Chain Persistance
+# ----------------------------------------------------------------------------
+
+CHAIN_PATH = os.environ.get('TC_CHAIN_PATH', 'chain.dat')
+
+@with_lock(chain_lock)
+def save_to_disk():
+    with open(CHAIN_PATH, "wb") as f:
+        logger.info(f"saving chain with {len(active_chain)} blocks")
+        f.write(encode_socket_data(list(active_chain)))
+
+@with_lock(chain_lock)
+def load_from_disk():
+    if not os.path.isfile(CHAIN_PATH):
+        return
+    try:
+        with open(CHAIN_PATH, "rb") as f:
+            msg_len = int(binascii.hexlify(f.read(4) or b'\x00'), 16)
+            new_blocks = deserialize(f.read(msg_len))
+            logger.info(f"loading chain from disk with {len(new_blocks)} blocks")
+            for block in new_blocks:
+                connect_block(block)
+    except Exception:
+        logger.exception('load chain failed, starting from genesis')
+
+
 # UTXO set
 # ----------------------------------------------------------------------------
 
@@ -641,6 +666,7 @@ def mine_forever():
 
         if block:
             connect_block(block)
+            save_to_disk()
 
 
 # Validation
@@ -922,7 +948,7 @@ class GetBlocksMsg(NamedTuple):  # Request blocks during initial sync
     CHUNK_SIZE = 50
 
     def handle(self, sock, peer_hostname):
-        logger.debug("[p2p] recv getblocks from {peer_hostname}")
+        logger.debug(f"[p2p] recv getblocks from {peer_hostname}")
 
         _, height, _ = locate_block(self.from_blockid, active_chain)
 
@@ -989,27 +1015,33 @@ def read_all_from_socket(req) -> object:
     msg_len = int(binascii.hexlify(req.recv(4) or b'\x00'), 16)
 
     while msg_len > 0:
-        data += req.recv(1024)
-        msg_len -= 1024
+        tdat = req.recv(1024)
+        data += tdat
+        msg_len -= len(tdat)
 
     return deserialize(data.decode()) if data else None
 
 
 def send_to_peer(data, peer=None):
     """Send a message to a (by default) random peer."""
+    global peer_hostnames
+
     peer = peer or random.choice(list(peer_hostnames))
     tries_left = 3
 
     while tries_left > 0:
         try:
-            with socket.create_connection((peer, PORT)) as s:
+            with socket.create_connection((peer, PORT), timeout=1) as s:
                 s.sendall(encode_socket_data(data))
         except Exception:
             logger.exception(f'failed to send to peer {peer}')
             tries_left -= 1
             time.sleep(2)
         else:
-            break
+            return
+
+    logger.info(f"[p2p] removing dead peer {peer}")
+    peer_hostnames = {x for x in peer_hostnames if x != peer}
 
 
 def int_to_8bytes(a: int) -> bytes: return binascii.unhexlify(f"{a:0{8}x}")
@@ -1169,6 +1201,8 @@ PORT = os.environ.get('TC_PORT', 9999)
 
 
 def main():
+    load_from_disk()
+
     workers = []
     server = ThreadedTCPServer(('0.0.0.0', PORT), TCPHandler)
 
@@ -1181,7 +1215,7 @@ def main():
 
     if peer_hostnames:
         logger.info(
-            f'start inital block download from {len(peer_hostnames)} peers')
+            f'start initial block download from {len(peer_hostnames)} peers')
         send_to_peer(GetBlocksMsg(active_chain[-1].id))
         ibd_done.wait(60.)  # Wait a maximum of 60 seconds for IBD to complete.
 
