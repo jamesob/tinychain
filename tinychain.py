@@ -933,7 +933,7 @@ def get_merkle_root(*leaves: Tuple[str]) -> MerkleNode:
 # Peer-to-peer
 # ----------------------------------------------------------------------------
 
-peer_hostnames = {p for p in os.environ.get('TC_PEERS', 'tinychain.co').split(',') if p}
+peer_hostnames = {p for p in os.environ.get('TC_PEERS', '').split(',') if p}
 
 # Signal when the initial block download has completed.
 ibd_done = threading.Event()
