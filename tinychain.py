@@ -588,9 +588,8 @@ def assemble_and_solve_block(pay_coinbase_to_addr, txns=None):
         block = select_from_mempool(block)
 
     fees = calculate_fees(block)
-    my_address = init_wallet()[2]
     coinbase_txn = Transaction.create_coinbase(
-        my_address, (get_block_subsidy() + fees), len(active_chain))
+        pay_coinbase_to_addr, (get_block_subsidy() + fees), len(active_chain))
     block = block._replace(txns=[coinbase_txn, *block.txns])
     block = block._replace(merkle_hash=get_merkle_root_of_txns(block.txns).val)
 
