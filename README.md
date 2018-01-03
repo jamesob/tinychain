@@ -66,7 +66,7 @@ Python                           1            341            174            679
      [2017-08-05 13:09:21,489][tinychain:1077] INFO your address is 1898KEjkziq9uRCzaVUUoBwzhURt4nrbP8
      Mined in 0000000726752f82af3d0f271fd61337035256051a9a1e5881e82d93d8e42d66 at height 5
     ```
-
+If you encounter any AttributeError saying “NamedTuple object does not have certain attributes”, then probably your Python version is out of date. Just update the Python version to 3.6.1 or later.
 
 ## What is Bitcoin?
 
