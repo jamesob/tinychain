@@ -202,13 +202,3 @@ It's a shitty unicode Merkle tree. Give a guy a break here, this is freeware!
 ### Where can I get more of you ranting?
 
 [@jamesob](https://twitter.com/jamesob)
-
-### Do you take tips to Get Rich Quick™?
-
-Sure.
-
-![18ehgMUJBqKc2Eyi6WHiMwHFwA8kobYEhy](http://i.imgur.com/KAfUPA6.png)
-
-BTC: `18ehgMUJBqKc2Eyi6WHiMwHFwA8kobYEhy`
-
-Half of all tips will be donated to [an organization providing aid to Syrian refugees](http://www.moas.eu/).
