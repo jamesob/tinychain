@@ -100,7 +100,7 @@ class Params:
     MAX_MONEY = BELUSHIS_PER_COIN * TOTAL_COINS
 
     # The duration we want to pass between blocks being found, in seconds.
-    # This is lower than Bitcoin's configuation (10 * 60).
+    # This is lower than Bitcoin's configuration (10 * 60).
     #
     # #realname PowTargetSpacing
     TIME_BETWEEN_BLOCKS_IN_SECS_TARGET = 1 * 60
